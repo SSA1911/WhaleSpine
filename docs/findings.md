@@ -77,3 +77,5 @@ Acceptance numbers need care: bench arms measure drafts made/accepted over synth
 ## 7. Reproduction
 
 `bench/run_s7_chain.sh`, `bench/run_s7b_chain.sh`, `bench/run_s8_bind.sh`, `bench/run_s9_conditions.sh`, `bench/repro_acceptance.sh` record every command. `artifacts/` ships binary hashes + rustc version, head provenance and a calibration snapshot; `bench/logs/` ships the generate-mode evidence (paths redacted). The calibration snapshot predates the generate-mode runs; the expert profile is rewritten per run, so profile state is a live variable - the interleaved pairs control for it.
+
+cargo test --release (MSVC, STRATA_MODEL set): 112 passed, 1 failed. The failure (`standalone_external_draft_model_spec_step_matches_greedy`, Windows error 1224, user-mapped section) reproduces identically on unpatched v1.3.1 - pre-existing Windows mmap flake, unrelated to the patch.
