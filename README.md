@@ -1,128 +1,53 @@
-# RustingStrata
+# WhaleSpine
 
-[![Reviewed by Aletheore](https://img.shields.io/badge/Reviewed%20by-Aletheore-16140F)](https://aletheore.com)
+A fork of [RustingStudio/RustingStrata](https://github.com/RustingStudio/RustingStrata) — a pure-Rust inference engine for GGUF models, built for mixture-of-experts (MoE) models that do not fit in VRAM (experts that do not fit run on the CPU while the GPU works). All credit for RustingStrata itself goes to Vasyl Trefilov; this fork carries the modifications below under the same [RustingStrata License 1.0](https://github.com/RustingStudio/RustingStrata/blob/main/LICENSE.md).
 
-A pure-Rust inference engine for GGUF models, built for MoE models that do not fit in VRAM. The CUDA kernels are
-compiled at run time with NVRTC, and the same kernels run on Vulkan: no C++ build step, no ggml. Experts that do not
-fit in VRAM run on the CPU at the same time as the GPU work, and the expert placement adapts to the routing it sees.
+## What this fork changes
 
-Supported models: Qwen3, Qwen3-Next, Qwen3.5/3.6, Qwen3.8-Flash-Next, Recursive Flint, Gemma 4, DeepSeek-V4.1-Flash,
-GLM-5.3-Flash, Hy4-flash, Inkling 2 Mini and Kolibri 1.1. The architectures, the GGUF types and the notes for each model are in
-[docs/MODELS.md](docs/MODELS.md).
+**1. A fix for standalone DFlash2 draft heads on hyper-connection models** (upstream PR: *dflash: fix draft-feature capture on hyper-connection models*).
 
-Version 1.3.4.
+Speculative decoding runs a small "drafter" model a few tokens ahead and lets the big model check all of them in one pass; it only helps if the drafter's guesses match what the big model would have said (the "acceptance rate"). DFlash2 is a family of small drafter models published per target model. On models from the qwen4exp family (such as Qwen3.8-Flash-Next) — which carry their hidden state as several parallel "hyper-connection" streams per position — RustingStrata v1.3.1 fed the drafter the wrong data: the feature capture read one stream instead of the streams' average, so a well-trained head had only 44% of its drafts accepted on an 8k-context bench run (with the patch: 100%). The fix averages the streams before the capture, in both the decode-step and prefill paths. Two files, +18/−1 and +22/−2.
 
-## Numbers
+After the fix: 100% acceptance (480/480 at 131k), and on a same-session interleaved A/B, decode went from 30.8 to 47.7 tok/s at 131k context (+55%), at a 24% prefill cost. Details, caveats and the full evidence chain in [docs/findings.md](docs/findings.md).
 
-Qwen3.6-35B-A3B on an RTX 3060 12 GB (Ryzen 5 7600X, 32 GB RAM), CUDA, greedy, against llama.cpp tuned for the same
-file. Neither file fits in VRAM.
+**2. Windows build notes.** The shipped release binary is MSVC and fine. A local build made before installing Visual Studio can end up on the GNU Rust toolchain, whose worker path was markedly slower at long context in our measurements (see findings, section 1) — upstream's README already documents installing the VS C++ Build Tools first, and the fix is to follow that.
 
-| | RustingStrata | llama.cpp |
-|---|---|---|
-| UD-Q5_K_M (25.2 GiB), decode after a 4K prompt | **80.5 tok/s** | 64.4 |
-| UD-Q5_K_M, prefill of a 4K prompt | **1530 tok/s** | 1118-1122 |
-| UD-Q2_K_XL (11.7 GiB), decode after a 4K prompt | **113.4 tok/s** | 66.5 |
-| UD-Q2_K_XL, prefill of a 4K prompt | 2216 tok/s | ~2236 |
+## Build (Windows, MSVC)
 
-### Many users at once
-
-`serve --parallel N` decodes the requests together in one batched forward (CUDA). Same machine, same load script
-(`tools/loadtest.py`: N streamed chats at once, 128 reply tokens each, greedy), total decode tok/s:
-
-| Clients | Qwen3-4B, RustingStrata (Q4_K_M) | Qwen3-4B, vLLM 0.33 (bf16) | Qwen3.6-35B-A3B UD-Q5_K_M, RustingStrata |
-|---:|---:|---:|---:|
-| 1 | 91.3 | 36.7 | 49.0 |
-| 4 | 228.1 | 139.9 | 88.9 |
-| 16 | 799.0 | 520.1 | 100.7 |
-| 64 | 1698 | 1688-1765 | 129.3 |
-
-vLLM runs bf16 weights and RustingStrata Q4_K_M, so the dense columns are not like for like. The 27 GB MoE file does
-not fit on the 12 GB card, so vLLM was not run on it. RustingStrata reads each expert once for all requests of a step,
-runs the experts that are not in VRAM on the CPU, and keeps slot state that does not fit in VRAM in RAM. The MoE
-column moves by about 30% between runs on this machine (the 27 GB file is read through a 30 GB page cache).
-
-The method, the ranges, Vulkan, the other models and the quality checks are in
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
-
-## Install
-
-Download a binary for Linux or Windows from the [releases page](https://github.com/RustingStudio/RustingStrata/releases),
-or build it (Rust 2024 edition; on Windows install the Visual Studio C++ Build Tools first):
-
-```sh
-cargo build --release    # the binary is target/release/rustingstrata
+```
+rustup target add x86_64-pc-windows-msvc
+# VS 2022 Build Tools with the "Desktop development with C++" workload (upstream README requirement)
+RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release --target x86_64-pc-windows-msvc
+# --target is only needed while the default toolchain is GNU; after `rustup default stable-msvc`, plain `cargo build --release` suffices.
+# binary: target/x86_64-pc-windows-msvc/release/rustingstrata.exe
 ```
 
-A GPU run needs one of:
+CUDA needs no build step: kernels compile at run time via NVRTC. The NVRTC DLLs (`nvrtc64_130_0.dll`, `nvrtc-builtins64_130.dll`) come from the CUDA toolkit; place them next to the exe or on `PATH` (see the upstream README's runtime notes).
 
-- an NVIDIA driver with the CUDA NVRTC library (loaded at run time). Volta (sm_70), Turing (sm_75) and Ampere or newer
-  (sm_80+) work; CUDA 13 dropped Volta, so a V100 needs the 12.x toolkit. Pascal and older use Vulkan.
-  The library is found by name (`libnvrtc.so`; on Windows `nvrtc64_130_0.dll` or `nvrtc64_120_0.dll`, on `PATH` or
-  under `%CUDA_PATH%\bin`); `STRATA_NVRTC` names another file. Without it the run falls back to Vulkan.
-- a Vulkan 1.3 driver with shaderFloat64, int8/16/64 and subgroup size 32 or a fixed 64 (tested on RTX 3060, Radeon VII
-  and V100; Intel Arc lacks shaderFloat64).
-- for `--backend hip`: a ROCm runtime with hiprtc (`libamdhip64.so`, `libhiprtc.so`), also loaded at run time; the
-  kernels are compiled for the card's `gfx` target on first use. Experimental — status, numbers and limits are in
-  [docs/HIP.md](docs/HIP.md).
+## Measured results
 
-`--gpu` picks CUDA when it loads, else Vulkan; `--backend` chooses (`cuda`, `vulkan` or `hip`). The first CUDA run compiles the kernels (~15 s) and
-caches them. Every GPU tried so far is in [docs/SUPPORTED_GPUS.md](docs/SUPPORTED_GPUS.md).
+Everything below: Qwen3.8-Flash-Next GSQ-RCO Q2_0 (66.4 GB, MoE — 48 layers, 512 experts, 10 active per token), RustingStrata v1.3.1, greedy decoding, 131,072-token context with a 98,304-token prefill prompt, CUDA backend. Hardware/OS: Windows 11 Pro 26H2, RTX 4070 SUPER 12 GB (driver 617.14), Ryzen 9 7900X3D, 32 GB RAM, model on a local fixed drive. The model is larger than system RAM, so non-resident experts stream from RAM/disk — which is why the numbers are memory-behaviour-sensitive and why the headline A/B is interleaved in one session.
 
-## Quick start
+| arm | decode (tok/s) | notes |
+|---|--:|---|
+| upstream v1.3.1 release binary, no draft | 34.4 | reference |
+| this fork, no draft | 30.8 (30.1–31.7, 5 reps, interleaved) | within noise of the release binary |
+| this fork + DFlash2 Q8_0 head | 47.7 (43.7–49.9, 5 reps, interleaved) | acceptance 480/480; prefill 441.6 vs 583.3 (−24%) |
+| + `--kv q4` (3 reps, separate run) | 61.0 | speculative-only at this depth; see findings §2 |
 
-Run `rustingstrata` with no arguments (double-click `rustingstrata.exe` on Windows). It starts a server on
-http://127.0.0.1:8080 and opens a chat page that downloads models from Hugging Face and switches between the ones in
-your models folder. Any app that takes an OpenAI-compatible address (Open WebUI, Jan, SillyTavern, code editors) can
-use `http://127.0.0.1:8080/v1`.
+**Caveats that matter (details in docs/findings.md):**
 
-`rustingstrata interface` asks for the model, the mode (terminal chat, chat page, API server, speed test), GPU or CPU,
-the context length and the address, prints the command these make and runs it.
+- `bench` decodes a raw greedy continuation of a repeated prefill prompt — a near-copy task that flatters speculative decoding (100% acceptance, 65% expert hit). In generate mode on one deep ~90k-token prompt, no-draft ran ~14.6 tok/s (vs 33.7 in bench mode), MTP ~18.6 (+27%), DFlash2 ~11.4 (−22%), acceptance 69.0% — while a shallow generate-mode run flipped that ranking (no-draft 17.4, DFlash2 18.7, MTP 13.0). Every arm is a single run; treat all of it as directional, and measure your own workload before enabling a drafter.
+- Speculative decoding here does not reproduce undrafted greedy output byte-for-byte; even no-draft output forks between CUDA and Vulkan (near-tie argmax flips). Outputs stay coherent.
+- Every number is greedy decoding; sampled decoding was not measured.
 
-With flags:
+## Repo layout
 
-```sh
-M=path/to/model.gguf
+- `docs/findings.md` — the full investigation: approach, results, the bench-vs-generate caveat, output-identity evidence, open items, error history, reproduction
+- `AGENTS.md` — conventions for AI agents working in this repo
+- `bench/` — the harness scripts behind every number above, plus the evidence logs (paths redacted)
+- `artifacts/` — binary hashes, compiler version, head provenance, a calibration snapshot
 
-rustingstrata calibrate --model $M --dry-run  # preview the workload matrix and knob space
-rustingstrata calibrate --model $M     # once per model and machine: best chunk, MTP drafts, short threshold
-rustingstrata chat --model $M --gpu    # --think for thinking mode, --temp 0.7 to sample
-rustingstrata generate --model $M --gpu --prompt "Write a haiku about rivers." -n 128
-rustingstrata serve --model $M --gpu --addr 127.0.0.1:8080
-rustingstrata bench --model $M --gpu --pp 512,4096 --tg 128
-```
+## Status
 
-Without `--gpu` the model runs on the CPU reference, which is slow and meant for checking. DeepSeek, GLM, Hy4 and
-Inkling 2 open the GPU by themselves.
-
-## Docs
-
-- [USAGE.md](docs/USAGE.md): flags, the chat page and MCP tools, the OpenAI and Anthropic APIs, prompt caching,
-  several GPUs.
-- [CALIBRATION.md](docs/CALIBRATION.md): the budgeted search, task corpora, the `spec` sweep and the JSON file.
-- [MODELS.md](docs/MODELS.md): supported architectures and GGUF types, notes and caveats for each model.
-- [BENCHMARKS.md](docs/BENCHMARKS.md): every model against llama.cpp; older runs are in the
-  [benchmark history](docs/README.md#benchmark-history).
-- [HOSTING.md](docs/HOSTING.md): running a server for other people.
-- [SUPPORTED_GPUS.md](docs/SUPPORTED_GPUS.md) and [AMD.md](docs/AMD.md): the GPUs tried so far and AMD notes.
-- [VISION.md](docs/VISION.md): image input. [LORA.md](docs/LORA.md): LoRA adapters.
-
-## Development
-
-```sh
-cargo test --release                      # GPU tests need the model: STRATA_MODEL=path/to/model.gguf
-python -I tools/parity.py $M --extra "--gpu" --tag gpu   # agreement with llama.cpp (needs llama-server once)
-```
-
-CI only builds, so run the tests before a pull request.
-
-Source map: `src/gguf.rs` (file reader), `src/quant/` (dequantization), `src/model.rs` (CPU reference forward),
-`src/cuda/` and `src/vulkan/` (GPU kernels, behind `src/backend.rs`), `src/gpu_model.rs` (GPU forward),
-`src/expert_cache.rs` (expert placement), `src/deepseek/`, `src/glm/`, `src/hy4/`, `src/inkling2/` and `src/gemma4/`
-(the models with their own forward), `src/serve.rs` (HTTP), `src/chat.rs` (chat templates and tool calls),
-`src/main.rs` (CLI).
-
-## License
-
-RustingStrata is released under the [RustingStrata License 1.0](LICENSE.md). You may use, modify and distribute it,
-including for commercial services, as long as you keep the license and credit Vasyl Trefilov as the original author.
-You may not sell RustingStrata itself.
+The fix is prepared as an upstream PR (branch `dflash-hc-mean`, single commit on upstream `main`). Numbers were produced on one machine and one model; treat single-run values as indicative until the PR's repro steps are followed.
