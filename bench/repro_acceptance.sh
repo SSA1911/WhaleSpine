@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Regression repro for the hc-gather patch (docs/findings.md section 2).
-# Pre-patch: standalone DFlash2 heads accept ~0% of drafts.
-# Post-patch: this smoke run must exceed 90% acceptance, else exit 1.
+# Pre-patch: 44% draft acceptance (74/168 on an 8k-context run).
+# Post-patch: this run must exceed 90% acceptance, else exit 1.
 # Usage: bash bench/repro_acceptance.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."

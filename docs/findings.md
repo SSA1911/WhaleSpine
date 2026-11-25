@@ -4,7 +4,7 @@
 
 [RustingStrata](https://github.com/RustingStudio/RustingStrata) is a pure-Rust inference engine for GGUF models, built for mixture-of-experts (MoE) models that do not fit in VRAM. In an MoE model, each layer holds many small "expert" networks and routes every token to a few of them; the ones that do not fit in VRAM run on the CPU while the GPU works, which is why speed depends on memory behaviour as much as on compute.
 
-This document records an investigation into **speculative decoding** on RustingStrata v1.3.1 with **Qwen3.8-Flash-Next** at long context, and a bug fix it produced (upstream PR: *dflash: the draft reads the mean of the hyper-connection streams*).
+This document records an investigation into **speculative decoding** on RustingStrata v1.3.1 with **Qwen3.8-Flash-Next** at long context, and a bug fix it produced (upstream PR: *dflash: fix draft-feature capture on hyper-connection models*).
 
 Some terms used throughout:
 
@@ -63,7 +63,7 @@ The first local build measured ~21 t/s against the release binary's 34.4 t/s —
 
 **The fix.** Collapse the hc streams to their plain mean first (RustingStrata's existing `hc_mix` with a saturated gate — sigmoid(12) ≈ 1 − 6·10⁻⁶, and the residual scale is absorbed by the following bias-free `fc` + `hidden_norm`), then copy. The prefill copy is tiled to `TMAX` blocks because `hc_mix`'s gate buffer indexes per position. Targets without hyper-connections take the unchanged path, and the mean scratch buffer is only allocated when needed. Two files, +18/−1 and +22/−2, no API or format changes.
 
-**Before / after, measured honestly.** With a correctly converted head and a calibrated profile, unpatched v1.3.1 accepts **44.0%** of drafts on the 8k bench smoke (`DFlash drafts accepted 74/168`). With the patch: **100%** (`96/96`; 5-rep 131k run: `480/480`). (An earlier claim of "0% before" came from runs with a mis-converted head — 1-based layer indices and a data-offset bug in our own remap of incoai's llama.cpp-format GGUF; the in-repo converter was never affected.)
+**Before / after, measured honestly.** With a working head and a calibrated profile, unpatched v1.3.1 accepts **44.0%** of drafts on an 8k-context bench run (`DFlash drafts accepted 74/168`). With the patch: **100%** (`96/96`; 5-rep 131k run: `480/480`). (An earlier draft of this document claimed "0% before": those runs used a head we remapped by hand from a llama.cpp-format GGUF, with two conversion bugs in our script. Passing the Hugging Face directory to the engine and letting it convert natively was always correct.)
 
 **Throughput, same-session interleaved pair** (both arms alternate rep-by-rep in one session on one binary, so page cache and profile state are shared):
 
