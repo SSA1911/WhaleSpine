@@ -24,7 +24,7 @@ Consequence: every measurement taken on a GNU local build is ~32% low. Ours were
 DFlash2 heads loaded through the standalone draft path accepted 0% of drafts. Three independent data problems produced that one symptom; this fork's patch fixes the gather logic (the engine-side one):
 
 1. hc-gather logic in gpu_model (this patch)
-2. 1-based vs 0-based target_layers in the upstream dflash loader (converter-side; heads must ship `dflash.target_layers = [5,15,25,35,45]` 0-based for this model)
+2. metadata convention mismatch: the shipped GGUF carries 1-based `dflash.target_layers` while the engine indexes 0-based (converter-side; heads must ship `[5,15,25,35,45]` for this model)
 3. remapper key alignment (converter-side)
 
 After the patch, on v1.3.1 + MSVC + CUDA, same-build matched pair:
@@ -36,7 +36,7 @@ After the patch, on v1.3.1 + MSVC + CUDA, same-build matched pair:
 
 Bind run on the rebuilt binary from the pushed commit (exe SHA-256 11f547b4...); the pre-rebase build measured 56.2 (49.0-59.0) - within noise.
 
-`--kv q4` adds +8.5% on top for spec runs (62.2, 55.4-65.8). It is a spec-only lever at this depth: the no-draft q4 control thrashes at 131k (expert-cache residency collapse; a 3-rep arm produced no completed rep in 108 minutes; a 32k probe runs fine at 29.9 t/s). `--spec-draft-n-max` does not reach the DFlash2 path (it populates only the ngram config; verified in source, main.rs:501-517) - deltas attributed to it are noise.
+`--kv q4` alone adds +8.5% for spec runs (61.0, 53.3-65.2). Stacked with other levers it measured 62.2 (55.4-65.8), but those deltas are unseparated at 3 reps. It is a spec-only lever at this depth: the no-draft q4 control thrashes at 131k (a 3-rep arm produced no completed rep in 108 minutes; a 32k probe runs fine at 29.9 t/s). Note the plan print shows q4 raises resident experts (3,552 vs 2,960 at q8), so the thrash mechanism is unresolved - do not attribute it to residency collapse. `--spec-draft-n-max` does not reach the DFlash2 path (it populates only the ngram config; verified in source, main.rs:501-517) - deltas attributed to it are noise.
 
 Head provenance: GGUF SHA-256 c00080c5..., source safetensors d6723f2a... (incoai/Qwen3.8-Flash-Next-DFlash2), converted with the in-repo converter (STRATA_DFLASH_Q8=1), config confirms 0-based target_layers [5,15,25,35,45], block_size 8.
 
@@ -50,13 +50,13 @@ The bench numbers above use synthetic prefill prompts. On real text the picture 
 | DFlash2 | 11.4 t/s (-22%) | 16.7% | 1,104 |
 | MTP(4) | 18.6 t/s (+27%) | 26.9% | 2,254 |
 
-Synthetic prompts route experts uniformly, so the cache pins a hot set (65% hit) and spec decode wins big. Real diverse text does not: hit rates collapse, and the DFlash2 head's own VRAM cuts resident experts from 2,960 to 1,104, halving the hit rate again. On real text at working depth the only positive lever we measured is MTP; DFlash2 is a net negative. Real-prompt prefill also collapses (89 t/s vs 677 on synthetic).
+Synthetic prompts route experts uniformly, so the cache pins a hot set (65% hit) and spec decode wins big. The deep prompt is not diverse text - it is 1,700 repeats of a 239-byte instruction file (~90k tokens) - and a bench-mode arm on that same file still shows the synthetic ranking (DFlash2 52.6 t/s, 100% acceptance, 37.6% hit). What the table shows is a generate-mode result that did not transfer from bench mode on the same content; the regime boundary is bench-vs-generate and is unexplained. The DFlash2 arm did run with the lowest residency (1,104 experts) and lowest hit (16.7%), and the MTP win tracks worker-busy amortization (33.6 vs 51.9 ms) rather than hit rate. On this measurement the only positive generate-mode lever is MTP; DFlash2 is a net negative there. Prefill: the tiled-file prompt prefills at 573 (no-draft) vs 677 synthetic; genuinely diverse source text prefills far slower (89 t/s, -87%) but never produced decode output (section 5).
 
-Single prompt, single run, n=1 - treat as directional until replicated. But the direction is consistent with the mechanism, and every headline number in section 2 should be read as "synthetic-prompt regime".
+Single prompt, single run, n=1, repetitive content - treat as directional until replicated on genuinely diverse text (blocked by the EOS issue below). Every headline number in section 2 should be read as "synthetic-prompt bench regime".
 
 ## 4. Output identity
 
-Speculative decoding on this engine does not reproduce token-by-token greedy output byte-for-byte. Elimination evidence: no-draft is stable within a backend; DFlash2 diverges on both CUDA and Vulkan (not the CUDA batched kernels); native MTP(4), which touches none of the hc-gather code, diverges too. Consistent with batched-vs-scalar accumulation differences flipping near-tie argmax decisions; we did not measure logit margins, so we claim consistency, not proof. All observed divergent outputs were coherent, on-task continuations. Note: v1.3.1's `generate --help` says "greedy output unchanged" for --mtp; our counterexample contradicts that claim at depth (27-token prompt, generate).
+Speculative decoding on this engine does not reproduce token-by-token greedy output byte-for-byte. Elimination evidence: no-draft is stable within a backend; DFlash2 diverges on both CUDA and Vulkan (not the CUDA batched kernels); native MTP(4), which touches none of the hc-gather code, diverges too. Consistent with batched-vs-scalar accumulation differences flipping near-tie argmax decisions; we did not measure logit margins, so we claim consistency, not proof. All observed divergent outputs were coherent, on-task continuations. Note: v1.3.1's `generate --help` says "greedy output unchanged" for --mtp; on a real ~90k-token prompt the MTP(4) output diverged from no-draft within the first tokens (whole-output divergence, coherent on both sides). If the help text means behavioral equivalence rather than bit-identity, this is a documentation-accuracy point rather than a correctness bug.
 
 Acceptance numbers need care: bench arms measure drafts made/accepted over synthetic prompts (100% here); the real-prompt identity runs measured 69.0% (DFlash2) and 82.8% (MTP). Always report which.
 
