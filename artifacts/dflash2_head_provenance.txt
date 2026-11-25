@@ -1,0 +1,4 @@
+c00080c5b0d36de62f8f964b157e079c7732b3bf935410f932b1c72544805cbf *model-dflash-q8_0.gguf
+d6723f2a359eaf33ec0c95f22ae8edda896774020c552296a85e1913b4d3186f *model.safetensors
+{'architectures': ['DFlash2DraftModel'], 'attention_bias': False, 'attention_dropout': 0.0, 'bos_token_id': 248044, 'dflash_config': {'block_size': 8, 'conv_group_size': 16, 'conv_kernel_size': 2, 'mask_token_id': 248077, 'selector_rank': 256, 'selector_top_k': 16, 'target_layer_ids': [5, 15, 25, 35, 45]}, 'dtype': 'bfloat16', 'eos_token_id': 248044, 'head_dim': 128}
+converter: RustingStrata in-repo converter, STRATA_DFLASH_Q8=1, build rustc 1.100.0 gnu, 2026-11-24
