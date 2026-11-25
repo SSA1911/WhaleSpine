@@ -88,7 +88,7 @@ impl Scratch {
             slab: gpu.zeros::<f32>(total)?,
             feat: if c.eagle3.is_some() { Some(gpu.zeros::<f32>(3 * ne * chunk)?) } else { None },
             dflash_feat: c.dflash.as_ref().map(|dc| gpu.zeros::<f32>(dc.target_layer_ids.len() * ne * chunk)).transpose()?,
-            dflash_mean: c.dflash.as_ref().map(|_| gpu.zeros::<f32>(ne * chunk)).transpose()?,
+            dflash_mean: if c.dflash.is_some() && c.hc_n > 0 { Some(gpu.zeros::<f32>(ne * chunk)?) } else { None },
             ints: gpu.zeros::<i32>(3 * chunk * k)?, tiles: gpu.zeros::<u64>(2 * n_tiles)?,
             staging: gpu.zeros::<u8>(if c.is_moe() { 3 * STAGE * stage_bytes } else { 0 })?,
         })

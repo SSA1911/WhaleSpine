@@ -2011,15 +2011,15 @@ impl<'a> GpuModel<'a> {
                     // hc targets (qwen4exp): the drafter reads the plain mean of the hc streams
                     // (mirrors llama.cpp's hc_stream_mean); hc_mix with a constant large gate
                     // yields sum * sigmoid(g) / hc = mean.
-                    let (src, row) = if self.m.cfg.hc_n > 0 {
+                    let src = if self.m.cfg.hc_n > 0 {
                         g.hc_mix(self.x.addr(), df.dfg.addr(), df.dfm.addr(), ne, self.m.cfg.hc_n, nt)?;
-                        (&df.dfm, ne)
+                        &df.dfm
                     } else {
-                        (&self.x, ne)
+                        &self.x
                     };
                     g.batch(&mut || {
                         for r in 0..nt {
-                            g.dtod(src, 4 * r * row, &df.feat, 4 * (r * n_ids + idx) * ne, 4 * ne)?;
+                            g.dtod(src, 4 * r * ne, &df.feat, 4 * (r * n_ids + idx) * ne, 4 * ne)?;
                         }
                         Ok(())
                     })?;
