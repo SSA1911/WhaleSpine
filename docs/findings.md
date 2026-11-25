@@ -24,7 +24,7 @@ Some terms used throughout:
 | GPU | NVIDIA RTX 4070 SUPER 12 GB, driver 617.14 |
 | CPU / RAM | AMD Ryzen 9 7900X3D, 32 GB DDR5 |
 | Model storage | local fixed drive (Z:) |
-| Engine | RustingStrata v1.3.1 (upstream `main` @ `4b3f44b` at measurement time; upstream has since released v1.3.2 @ `932b252`, which also fixes a Windows working-set accounting issue relevant to expert streaming); CUDA kernels compiled at run time by NVRTC — no CUDA build step |
+| Engine | RustingStrata (upstream `main`): sections 1–3 measured on v1.3.1 @ `4b3f44b`; the PR and the serving comparison (section 3.5) re-run on v1.3.4 @ `a02a259`, which also fixed Windows working-set accounting relevant to expert streaming. CUDA kernels compiled at run time by NVRTC — no CUDA build step |
 | Compiler | rustc 1.100.0 (0ef1bc386, 2026-11-09), LLVM 23.1.5; MSVC build via `--target x86_64-pc-windows-msvc`, `RUSTFLAGS="-C target-cpu=x86-64-v3"` |
 | Model | Qwen3.8-Flash-Next GSQ-RCO Q2_0 — 66.4 GB across two shards (61.9 GiB), qwen4exp A3B MoE, 48 layers, 512 experts, 10 active per token |
 | Head | incoai/Qwen3.8-Flash-Next-DFlash2, safetensors `d6723f2a…`, converted with the in-repo converter, GGUF SHA-256 `c00080c5…` |
@@ -76,6 +76,8 @@ The first local build measured ~21 t/s against the release binary's 34.4 t/s —
 
 Two honesty notes. First, the same configurations measured in *different sessions* spread 50.0–56.3 t/s (≈12% drift) on the DFlash2 arm; cross-session A/Bs are why our first headline (+88%) and a later one (+67%) were both wrong in different directions — the interleaved pair is the number we stand behind. Second, `--kv q4` (a smaller KV cache) added ~+8.5% for speculative runs (61.0 t/s, 3 reps), but a no-draft q4 control at 131k thrashed (no completed rep in 108 minutes; a 32k probe ran fine at 29.9 t/s), so quote q4 as a speculative-only configuration, and note its mechanism is unresolved — the no-draft q4 control's plan print shows q4 *raises* resident experts (3,552 vs 2,960), while the spec q4 arm itself ran 2,160 resident (vs 1,104 at q8 spec) — the two arms run different memory plans, which is part of why the mechanism is hard to pin. `--spec-draft-n-max` does not reach the DFlash2 path at all (it populates only the ngram config; `main.rs:501–517`) — deltas attributed to it were noise.
 
+**On the current base (v1.3.4).** The PR was rebased onto upstream v1.3.4 (`dflash-hc-mean` @ `32bde88`, diff +40/−3) and the acceptance check re-run: unpatched stock v1.3.4 accepts **72/168 (42.9%)** on the same 8k-context bench run — the bug is still live upstream — and the patched build accepts **96/96 (100%)**. Patched 8k prefill 125.5 vs 125.8 unpatched (reps 1): the ≈−13% prefill cost measured on v1.3.1 does not show on v1.3.4 (single rep, treat as unmeasured). One engine fact worth recording for anyone extending this: the DFlash2 drafter's attention cache is allocated for the full context (`src/gpu_model.rs`, `kv_words(ctx * df_kv)`) although the head's attention window is 2,048 tokens (`sliding_window` in its config) — about 1.4 GB wasted at 131k context, part of why only 1,104 experts stay resident with the drafter attached.
+
 ## 3. The bench-vs-generate caveat (the practically important part)
 
 `bench` decodes a raw greedy continuation of the prefill prompt; `generate` writes a chat-style reply. On our bench prompt (a repeated instruction file) those are near-copy tasks with a narrow, repeating expert set — which flatters speculative decoding.
@@ -97,7 +99,23 @@ Readings from this run, all single-run/n=1:
 - On this measurement, MTP is the only positive generate-mode lever (+27%), tracking worker-busy amortization (33.6 vs 51.9 ms) rather than hit rate.
 - This ranking is not stable across depth. Our identity-check runs — invalid as identity checks (a file path was passed as the prompt) but still valid shallow-depth throughput samples — flipped it: no-draft 17.43, DFlash2 18.70 (+7%), MTP 12.97 (−26%) on CUDA. Every arm here is n=1; treat both directions as unsettled until the deep diverse-text comparison is unblocked (section 5).
 
-Do not generalize the generate-mode ranking from one prompt on repetitive content; replication on genuinely diverse text is blocked by the EOS issue below.
+Do not generalize the generate-mode ranking from one prompt on repetitive content.
+
+## 3.5 Serving-mode comparison (chat, real text, end-to-end — the decisive test)
+
+The bench-vs-generate gap above motivated a comparison on the real serving path. Arms: no-draft, MTP with 1/2/3 drafts per step, DFlash2 with 1/2/3. Prompts: three depths (≈1.9k / 8.7k / 24.3k tokens) of genuinely mixed Rust source plus a summarizing instruction, sent through the OpenAI-compatible `serve` endpoint (chat template), 512-token reply budget, greedy. One request per freshly started server process, so the server's prefix cache cannot skip prefill between cells. Patched v1.3.4 build, CUDA, RTX 4070 SUPER.
+
+| arm | 2k tok | 8k tok | 24k tok |
+|---|--:|--:|--:|
+| no draft | 58.8 s | 126.6 s | 282.5 s |
+| MTP best (3 drafts) | 54.1 (−8%) | 118.0 (−7%) | 291.2 (+3%) |
+| DFlash2 best (1 draft) | 54.5 (−7%) | 121.1 (−4%) | 317.0 (+12%) |
+
+Single rep per cell; the full grid is in `bench/e2_cells.jsonl` (21 cells, every drafter length recorded). Reading:
+
+- No drafter configuration beats no-draft beyond single-run noise at any depth. At 24k every drafter arm is *slower* than no-draft (DFlash2 worst, +6–12%): the drafter's VRAM cost and (for DFlash2) its prefill capture cost outweigh the drafting gain on real reasoning-style workloads.
+- DFlash2 does not beat MTP at any depth. Per the decision rule fixed before the run — tuned DFlash2 must beat tuned MTP end-to-end on at least 2 of 3 prompts by more than run spread — the DFlash2 serving investigation **stops here**. A planned deeper-context (32k vs 131k) run was skipped as moot: at 24k the drafter's wasted full-context cache is already small and DFlash2 still loses, so the engine change (sizing the drafter cache to its 2,048-token window) cannot flip this verdict, though the ~1.4 GB waste at 131k remains a real memory issue worth reporting upstream on its own merits.
+- MTP at 3 drafts is the only arm that trends positive (−8%/−7%), and only at shallow depth; at 24k it is +3%. Treat as "no measurable serving win" rather than a recommendation.
 
 ## 4. Output identity
 
@@ -107,7 +125,7 @@ Two practical notes follow. Acceptance percentages must always state their mode 
 
 ## 5. Open items
 
-- **Immediate EOS at depth**: `generate` on ~42k+ token diverse prompts (mixed Rust source) emits EOS at step 1 (exit 0, no output) on all paths including no-draft, while the same prompt tail at 1.5k tokens and a repetitive 90k prompt generate normally. An escape test that stripped all 9 `<|...|>` token-like literals (15 chat-role markers included) from the 42k prompt still produced no output — chat literals are ruled out, as is shared calibration state (runs rewrite the expert profile, not the calibration JSON). Trigger is depth/content; unresolved.
+- **Immediate EOS at depth — resolved; not an engine bug.** `generate --prompt` (raw text, no chat template) on long code dumps made the model continue the pasted code (2k/4k of source) or end its turn immediately (≥8k; appending an instruction did not help; the boundary sits between 4k and 8k tokens of source text). Through the chat template (`serve`, OpenAI endpoint) the same 16k-token prompt is answered normally (`finish: stop`, correct content). Two things had made this look like a bug: raw-generate prompting gives the model nothing to reply to, and the model is a *reasoning* model — its reply text arrives in `reasoning_content`, so an empty `content` field only means the token budget ran out mid-reasoning. Deep diverse-text comparisons are unblocked via the chat path (section 3.5 used it).
 - `--spec-type ngram-*` hybrid cascade on top of DFlash2: untested. `--threads`, `--chunk`: untested.
 - Sampled (non-greedy) speculative acceptance: not measured; every number here is greedy.
 - An earlier suspected regression in commit `bbd57c2` was retracted — it was the GNU-toolchain confound, not the commit.
@@ -126,10 +144,10 @@ Two practical notes follow. Acceptance percentages must always state their mode 
 
 ## 7. Reproduction
 
-Everything is scripted: `bench/repro_acceptance.sh` (the 8k before/after check), `bench/run_s7_chain.sh` / `run_s7b_chain.sh` (flag sweeps), `bench/run_s8_bind.sh` and `bench/run_s9_conditions.sh` (before arm, escape test, interleaved pair). `bench/logs/` ships the generate-mode evidence with local paths redacted; `artifacts/` ships binary SHA-256s, the rustc version, head provenance and a calibration snapshot.
+Everything is scripted: `bench/repro_acceptance.sh` (the 8k before/after check), `bench/run_s7_chain.sh` / `run_s7b_chain.sh` (flag sweeps), `bench/run_s8_bind.sh` and `bench/run_s9_conditions.sh` (before arm, escape test, interleaved pair), `bench/e2_sweep.sh` (the serving-mode comparison of section 3.5, one fresh server per cell). `bench/logs/` ships the generate-mode evidence with local paths redacted; `artifacts/` ships binary SHA-256s, the rustc version, head provenance and a calibration snapshot.
 
 `cargo test --release` (with `STRATA_MODEL` set): 112 passed, 1 failed. The failure (`standalone_external_draft_model_spec_step_matches_greedy`, Windows error 1224 "user-mapped section open") reproduces identically on unpatched v1.3.1 — a pre-existing Windows mmap flake in the test, not a change from the fix.
 
 ## Conclusion
 
-The capture bug is real and the fix is small: standalone DFlash2 heads went from 44% to 100% bench acceptance on a hyper-connection target, and the same-session interleaved pair shows +55% decode at 131k context (with a 24% prefill cost). Whether speculative decoding pays off in *serving* is workload-dependent: our one deep generate-mode run favoured MTP and penalized DFlash2, and bench-mode numbers in general overstate serving decode on this engine. Treat the bench table as a correctness-and-bench-regime result, and the generate-mode section as the reason to measure your own workload before enabling a drafter.
+The capture bug is real and the fix is small: standalone DFlash2 heads went from ~44% to 100% bench acceptance on a hyper-connection target, verified on both v1.3.1 and v1.3.4 (llama.cpp fixed the identical bug the same way). But in serving mode on real text (chat, end-to-end, section 3.5), no drafter configuration beat plain no-draft decoding beyond noise on this machine, and DFlash2 was the worst arm at depth — so the practical verdict for this hardware is: run no-draft, use the PR to make the DFlash2 path *correct* for those who evaluate it, and treat any bench-mode speedup as a bench-regime result. Whether speculative decoding pays off on other hardware or workloads is still workload-dependent; measure on the serving path before enabling a drafter.

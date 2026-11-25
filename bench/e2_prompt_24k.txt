@@ -1,0 +1,1156 @@
+// ==== /z/ai-models/rs-v131wt/src/backend.rs
+//! Backend seam: device memory as `Buf` (an address plus whatever keeps the memory alive) and the kernel ops the
+//! model runs. Every op takes device addresses, so model code never sees backend types. `cuda` and `vulkan` implement it.
+
+use crate::quant::GgmlType;
+use crate::weights::Tensor;
+use std::any::Any;
+
+/// Blocks per head in decode attention (positions split across them). Scratch sizes depend on it.
+pub const ATT_SPLITS: usize = 32;
+/// Splits of the one-head-per-block decode attention used below ATT_GQA_MIN positions.
+pub const ATT_SPLITS_1: usize = 16;
+/// Positions from which decode attention shares K/V loads across a GQA group (break-even measured near 2K).
+pub const ATT_GQA_MIN: i32 = 2048;
+const _: () = assert!(ATT_SPLITS <= 256); // attn_merge keeps one weight per split in a 256-thread block
+/// Positions per GEMM tile. Prefill cuts its tile lists at this size.
+pub const GEMM_BM: usize = 128;
+
+/// `len` bytes of device memory at device address `addr`, freed when the last clone drops.
+#[derive(Clone)]
+pub struct Buf {
+    addr: u64,
+    len: usize,
+    _owner: std::sync::Arc<dyn Any + Send + Sync>,
+}
+
+impl Buf {
+    pub fn new(addr: u64, len: usize, owner: impl Any + Send + Sync) -> Buf { Buf { addr, len, _owner: std::sync::Arc::new(owner) } }
+    pub fn addr(&self) -> u64 { self.addr }
+    pub fn len(&self) -> usize { self.len }
+}
+
+#[derive(Clone)]
+pub struct GpuTensor {
+    pub ty: GgmlType,
+    pub rows: usize,
+    pub cols: usize,
+    pub ptr: u64,
+    pub scale: f32,
+    _buf: Buf,
+}
+
+impl GpuTensor {
+    /// `rows` x `cols` of `ty` stored in `buf` from its start.
+    pub fn new(ty: GgmlType, rows: usize, cols: usize, buf: Buf) -> GpuTensor { GpuTensor { ty, rows, cols, ptr: buf.addr, scale: 1.0, _buf: buf } }
+    pub fn with_scale(mut self, scale: f32) -> GpuTensor { self.scale = scale; self }
+    pub fn bytes(&self) -> usize { self.ty.row_bytes(self.cols as u64) * self.rows }
+}
+
+/// Values copied to and from device memory as raw bytes.
+/// Safety: no padding bytes, and every bit pattern is a valid value.
+pub unsafe trait Plain: Copy + Default + 'static {}
+unsafe impl Plain for f32 {}
+unsafe impl Plain for i32 {}
+unsafe impl Plain for u32 {}
+unsafe impl Plain for u16 {}
+unsafe impl Plain for u8 {}
+unsafe impl Plain for u64 {}
+
+/// Device memory, recorded graphs and kernel ops. Host copies are synchronous; device work runs in queue order.
+/// Pointer arguments are device addresses; strides are in floats unless named otherwise.
+/// The backend `kind` ("cuda", "vulkan" or "hip") on GPU `device`; with no kind, CUDA if it loads, else Vulkan.
+/// Refuses a `--device` list with several indices on the HIP backend: `hip::Gpu` opens one device per process
+/// (hipSetDevice runs once, in `Gpu::new`), so a split over two cards would run both layers on the first one.
+pub fn check_devices(kind: Option<&str>, devices: &[usize]) -> anyhow::Result<()> {
+    if kind == Some("hip") && devices.len() > 1 {
+        anyhow::bail!("the hip backend runs one device: --device {} needs cuda or vulkan", devices.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(","));
+    }
+    Ok(())
+}
+
+/// Opens every device of a `--device` list, after the check above. Callers open a list through this, not one device at a time.
+pub fn open_all(kind: Option<&str>, devices: &[usize]) -> anyhow::Result<Vec<Box<dyn Backend>>> {
+    check_devices(kind, devices)?;
+    devices.iter().map(|&d| open(kind, d)).collect()
+}
+
+pub fn open(kind: Option<&str>, device: usize) -> anyhow::Result<Box<dyn Backend>> {
+    match kind {
+        Some("cuda") => Ok(Box::new(crate::cuda::Gpu::new(device)?)),
+        Some("vulkan") => Ok(Box::new(crate::vulkan::Vk::new(device)?)),
+        Some("hip") => Ok(Box::new(crate::hip::Gpu::new(device)?)),
+        Some(k) => anyhow::bail!("unknown backend {k:?} (cuda, vulkan or hip)"),
+        None => match crate::cuda::Gpu::new(device) {
+            Ok(g) => Ok(Box::new(g)),
+            Err(c) if format!("{c}") == "CUDA init" => {
+                let v = crate::vulkan::Vk::new(device).map_err(|v| anyhow::anyhow!("no GPU backend loads: CUDA: {c:#}; Vulkan: {v:#}"))?;
+                eprintln!("CUDA unavailable ({c:#}), using Vulkan");
+                Ok(Box::new(v))
+            }
+            Err(c) => Err(c),
+        },
+    }
+}
+
+/// Which usable Vulkan device each GPU index opens, so that an index is the same card on both backends. `cuda` is the
+/// identifier of every CUDA device in CUDA's order (`None`: the driver gives none), `vk` the one of every usable
+/// Vulkan device in the order Vulkan alone would count them. Index i is the position in `vk` of CUDA device i's
+/// identifier, `None` when no usable Vulkan device has it. A CUDA device without identifier takes the next Vulkan
+/// device that no CUDA device names, and the rest of those follow the CUDA devices: with no CUDA device, or none
+/// that Vulkan knows, the order is `vk`'s own.
+pub fn device_order<T: PartialEq>(cuda: &[Option<T>], vk: &[T]) -> Vec<Option<usize>> {
+    let mut rest = (0..vk.len()).filter(|&i| !cuda.iter().flatten().any(|c| *c == vk[i]));
+    let mut order: Vec<_> = cuda.iter().map(|c| match c { Some(c) => vk.iter().position(|v| v == c), None => rest.next() }).collect();
+    order.extend(rest.map(Some));
+    order
+}
+
+/// `gemm` `act` flag: x is unchanged since the previous gemm call, which read the same x, so its int8 copy is reused.
+pub const SAME_X: i32 = 4;
+/// `gemm_dense` `act` flag: the call is a step of a batch of requests (`step_batch`), so the backend may take a kernel
+/// that sums the products in another order than the prefill GEMM. Paths of a single request leave it clear: their bits
+/// do not change.
+pub const BATCHED: i32 = 8;
+
+/// The weight type `Backend::upload` stores a tensor of type `ty` as: F16 as F32 (no F16 kernels; F32 holds every F16
+/// value exactly). Expert tensors are copied raw by `GpuModel::load_part`, not through `upload`.
+pub fn upload_type(ty: GgmlType) -> GgmlType { if ty == GgmlType::F16 { GgmlType::F32 } else { ty } }
+
+pub trait Backend: Send {
+    /// "cuda", "vulkan" or "hip".
+    fn name(&self) -> &'static str;
+    /// The GPU's name as the driver reports it.
+    fn device(&self) -> String;
+    /// Create a lightweight handle sharing the same underlying GPU device/context for an auxiliary draft model.
+    fn share(&self) -> anyhow::Result<Box<dyn Backend>> {
+        anyhow::bail!("backend {} does not support device sharing", self.name())
+    }
+    /// Zeroed buffer of `bytes` (at least 1).
+    fn alloc(&self, bytes: usize) -> anyhow::Result<Buf>;
+    fn htod(&self, src: &[u8], dst: &Buf, off: usize) -> anyhow::Result<()>;
+    fn dtoh(&self, src: &Buf, off: usize, dst: &mut [u8]) -> anyhow::Result<()>;
+    fn dtod(&self, src: &Buf, src_off: usize, dst: &Buf, dst_off: usize, bytes: usize) -> anyhow::Result<()>;
+    /// Zero all of `dst`.
+    fn memset(&self, dst: &Buf) -> anyhow::Result<()>;
+    /// Free and total device memory in bytes.
+    fn mem_info(&self) -> anyhow::Result<(usize, usize)>;
+    /// Wait for all queued device work.
+    fn sync(&self) -> anyhow::Result<()>;
+    /// Run the ops `f` queues as the graph recorded under `key`, recording it on first use. `f` runs only when
+    /// recording, so its ops must read per-call values from device memory.
+    fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()>;
+    /// Free the graph recorded under `key`, if there is one. For a caller whose keys change as it runs (a graph holds
+    /// device memory, and CUDA stops recording at a fixed number of them).
+    fn graph_drop(&self, _key: u64) -> anyhow::Result<()> { Ok(()) }
+    /// Queue the ops of `f`, none of which reads what another writes, with no ordering among them (Vulkan: no
+    /// barriers between them); ops after the batch see all their results.
+    fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> { f() }
+    /// Queue the ops of `f` in order, its host copies beside its other ops (CUDA: on a side stream), so none of
+    /// those ops may read what a copy writes. The copies see the ops before `f`. Ops after `f` see the copies of the
+    /// `beside` before this one, not yet these: they run on beside the next `beside` too (`beside_join` waits).
+    fn beside(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> { f() }
+    /// Ops after this see the copies of every `beside` so far.
+    fn beside_join(&self) -> anyhow::Result<()> { Ok(()) }
+    /// Submit the ops queued so far without waiting. Long prefills call it per layer: amdgpu resets the GPU when one
+    /// submission runs over its timeout (10 s).
+    fn kick(&self) -> anyhow::Result<()> { Ok(()) }
+    /// Whether `beside` really overlaps its copies with its other ops (else it queues them in order).
+    fn beside_overlaps(&self) -> bool { false }
+    /// Whether a MoE combine gave up waiting for the CPU worker since the last call (checked after a wait). Its layer
+    /// added nothing and the rest of that submission was skipped: the caller waits for the worker and runs the
+    /// forward again from that combine. Clears the flag. Backends whose combines never give up return false.
+    fn stalled(&self) -> bool { false }
+    /// Whether the prefill GEMM for `ty` runs on int8 tensor cores on this backend: the type policy of `Gpu::mmq`,
+    /// gated on the device. Tests build their reference math from this, since the CUDA launcher takes the f16
+    /// `gemm_*` path where the arch has no int8 tensor cores (sm_70) even for an int8 type.
+    fn mmq(&self, ty: GgmlType) -> bool { crate::cuda::Gpu::mmq(ty) }
+    /// Whether this backend runs the Volta (sm_70) CUDA fallbacks, whose kernels sum the same f16 products in
+    /// another order than `mma.sync`. A cross-backend comparison against or from such a backend is by tolerance.
+    fn volta(&self) -> bool { false }
+    /// Zeroed host memory of `words` u32 that kernels read and write at the `Buf` address. The host pointer is
+    /// valid while the `Buf` lives.
+    fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)>;
+
+    /// Refuse, before any weight is uploaded, if a pipeline these weight types (`GpuModel`'s upload types) need would
+    /// exceed the device's shared-memory limit; `verbose` also lists each checked (kernel, specialization) pair.
+    /// Vulkan computes it from the committed SPIR-V and the specialization constants; backends without a Workgroup
+    /// shared-memory limit have nothing to check.
+    fn preflight(&self, _types: &[GgmlType], _verbose: bool) -> anyhow::Result<()> { Ok(()) }
+
+    fn upload(&self, t: &Tensor) -> anyhow::Result<GpuTensor> {
+        let gt = match upload_type(t.ty) {
+            GgmlType::F32 if t.ty == GgmlType::F16 => {
+                let mut f = vec![0f32; t.rows * t.cols];
+                crate::quant::dequant_row(GgmlType::F16, t.data, &mut f);
+                let b = self.alloc(4 * f.len())?;
+                self.htod(&f.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>(), &b, 0)?;
+                GpuTensor::new(GgmlType::F32, t.rows, t.cols, b)
+            }
+            ty => {
+                let b = self.alloc(t.data.len())?;
+                self.htod(t.data, &b, 0)?;
+                GpuTensor::new(ty, t.rows, t.cols, b)
+            }
+        };
+        Ok(gt.with_scale(t.scale))
+    }
+
+    fn upload_raw(&self, t: &Tensor) -> anyhow::Result<GpuTensor> {
+        let b = self.alloc(t.data.len())?;
+        self.htod(t.data, &b, 0)?;
+        Ok(GpuTensor::new(t.ty, t.rows, t.cols, b).with_scale(t.scale))
+    }
+
+    /// u16 words of a KV cache for `n` values: f16, or q8 with one f16 scale per 32 values.
+    fn kv_words(&self, n: usize) -> usize;
+    /// GEMM over a tile list: for each tile, positions m0 .. m0 + cnt get y[m, 0..rows] = W_tile x[xrow[m]] (x row m
+    /// when `xrow` is 0). `tiles` is a device array of [w, m0 | cnt << 32]. `act`: 0 stores, 1 computes
+    /// y = silu(y) * result (SwiGLU with the gate already in y), 2 adds to y; `| SAME_X` as below. `n_x`: rows of x
+    /// the tiles read.
+    fn gemm(&self, ty: GgmlType, rows: usize, cols: usize, tiles: u64, n_tiles: usize, x: u64, x_stride: usize, n_x: usize, xrow: u64, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()>;
+    /// Whether `gemm` and `gemm_dense` run on int8 tensor cores for `ty` (the alternative is f16 products), so tests
+    /// and callers build their reference the way this backend will.
+    fn int8_gemm(&self, ty: GgmlType) -> bool;
+    /// y[m] (op) W x[m] for positions m < n, x and y rows `x_stride` / `y_stride` floats apart.
+    fn gemm_dense(&self, w: &GpuTensor, n: usize, x: u64, x_stride: usize, y: u64, y_stride: usize, act: i32) -> anyhow::Result<()>;
+    fn prequant_gemm_x(&self, _w: &GpuTensor, _n: usize, _x: u64, _x_stride: usize) -> anyhow::Result<()> { Ok(()) }
+    /// y = W x (all rows of `w`).
+    fn gemv(&self, w: &GpuTensor, x: u64, y: u64) -> anyhow::Result<()>;
+    /// y[t] = W x[t] for t < nt (1 to 4; x[t] at x + 4 * t * x_stride bytes, y[t] at y + 4 * t * y_stride); each
+    /// weight block is read once for all nt.
+    fn gemvn(&self, w: &GpuTensor, x: u64, x_stride: usize, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()>;
+    /// `gemvn` that reads x pre-quantized by `quant_xq` at `xq` (0 = quantize x itself; float weights read x).
+    fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()>;
+    /// `gemvq` of `a` into `ya` and of `b` into `yb` on the same x (columns alike; output rows `a.rows` / `b.rows` apart).
+    fn gemvq2(&self, a: &GpuTensor, b: &GpuTensor, x: u64, x_stride: usize, xq: u64, ya: u64, yb: u64, nt: usize) -> anyhow::Result<()> {
+        self.gemvq(a, x, x_stride, xq, ya, a.rows, nt)?;
+        self.gemvq(b, x, x_stride, xq, yb, b.rows, nt)
+    }
+    /// Whether this backend supports indexed-row GEMV (`gemv_rows`).
+    fn supports_gemv_rows(&self) -> bool { false }
+    /// `y[i] = W[ids[i]] x` for `i < n_rows` (indexed subset of rows of `w`).
+    fn gemv_rows(&self, _w: &GpuTensor, _x: u64, _ids: u64, _n_rows: usize, _y: u64) -> anyhow::Result<()> {
+        anyhow::bail!("gemv_rows unsupported on this backend")
+    }
+    /// `y[t * n_rows + i] = W[ids[i]] x[t]` for `t < nt`, `i < n_rows`.
+    fn gemv_rows_n(&self, w: &GpuTensor, x: u64, x_stride: usize, _xq: u64, ids: u64, n_rows: usize, y: u64, nt: usize) -> anyhow::Result<()> {
+        for t in 0..nt {
+            self.gemv_rows(w, x + (t * x_stride * 4) as u64, ids, n_rows, y + (t * n_rows * 4) as u64)?;
+        }
+        Ok(())
+    }
+    /// For j < k with ids[j] >= 0: y[j] = W_j x[j / xg], where W_j is the `rows` x `cols` matrix at w + ids[j] * stride
+    /// bytes. `pair` = (w2, y2) also computes the same product for the matrices at byte offset w2 into the output at
+    /// byte offset y2. `xq` (not 0): x pre-quantized by `quant_xq` (k / xg rows), read in place of x.
+    fn moe_gemv(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, ids: u64, k: usize, x: u64, x_stride: usize, xg: usize, y: u64, pair: Option<(i64, i64)>, xq: u64) -> anyhow::Result<()>;
+    /// out = the first `rows` rows of `w` as floats (a test helper).
+    fn dequant(&self, w: &GpuTensor, rows: usize, out: u64) -> anyhow::Result<()>;
+    /// Quantize `nt` rows of n floats (row t at x + 4 * t * x_stride bytes) for `gemvq` / `moe_gemv` into `out`:
+    /// the nt rows of n int8 values, then their f32 scales (one per 32 values), nt * (n + n / 8) bytes in all.
+    fn quant_xq(&self, x: u64, x_stride: usize, n: usize, nt: usize, out: u64) -> anyhow::Result<()>;
+    /// `rows` rows: out[r] = rmsnorm(x[r]) * w.
+    fn rms_norm(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32) -> anyhow::Result<()>;
+    /// `rms_norm` that also writes its output quantized as `quant_xq` does to `xq` (when not 0), and first adds `res`
+    /// (rows `x_stride` apart, when not 0) into x in place.
+    fn rms_norm_q(&self, x: u64, x_stride: usize, w: u64, out: u64, out_stride: usize, n: usize, rows: usize, eps: f32, xq: u64, res: u64) -> anyhow::Result<()>;
+    /// Per-stream RMSNorm of nt stacks of hc rows of n (contiguous) with the hc x n gamma `w`.
+    fn rms_norm_streams(&self, x: u64, w: u64, out: u64, n: usize, hc: usize, nt: usize, eps: f32) -> anyhow::Result<()> {
+        for s in 0..hc {
+            let o = 4 * (s * n) as u64;
+            self.rms_norm(x + o, hc * n, w + o, out + o, hc * n, n, nt, eps)?;
+        }
+        Ok(())
+    }
+    /// out[r] = argmax of row r of x (`rows` rows of n floats), first index on ties.
+    fn argmax_rows(&self, x: u64, n: usize, rows: usize, out: u64) -> anyhow::Result<()>;
+    /// Row r: vector r % per (n floats) of token r / per, tokens `stride` floats apart.
+    fn l2_norm(&self, x: u64, n: usize, per: usize, stride: usize, rows: usize, eps: f32) -> anyhow::Result<()>;
+    /// `heads` rows of `stride` floats, `per` per token; token t is at position step[0] + t.
+    fn rope_neox(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
+        self.rope_pairs(x, stride, heads, per, n_rot, step, base, 0, n_rot / 2)
+    }
+    /// `rope_neox` of pairs `lo..hi` only (M-RoPE: one call per section, each with its own position buffer).
+    fn rope_pairs(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, step: u64, base: f32, lo: usize, hi: usize) -> anyhow::Result<()>;
+    /// M-RoPE (`ops::rope_mrope`): section s of the pairs turns by position `pos[2 * s]` (`pos`: four [position, _]
+    /// i32 pairs); pairs past the sections use the last position.
+    fn rope_mrope(&self, x: u64, stride: usize, heads: usize, per: usize, n_rot: usize, pos: u64, base: f32, sections: [usize; 4]) -> anyhow::Result<()> {
+        let (half, mut lo) = (n_rot / 2, 0);
+        for (s, n) in sections.into_iter().enumerate() {
+            let hi = if s == 3 { half } else { (lo + n).min(half) };
+            if hi > lo { self.rope_pairs(x, stride, heads, per, n_rot, pos + 8 * s as u64, base, lo, hi)?; }
+            lo = hi;
+        }
+        Ok(())
+    }
+    /// `rms_norm` of `rows` heads of n (output rows of n), then `rope_neox` on them.
+    fn rms_norm_rope(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32) -> anyhow::Result<()> {
+        self.rms_norm(x, x_stride, w, out, n, n, rows, eps)?;
+        self.rope_neox(out, n, rows, per, n_rot, step, base)
+    }
+    /// `rms_norm_rope` of the k heads (`per` per token), then `kv_store` of them and v (rows of n, like out).
+    fn rms_norm_rope_kv(&self, x: u64, x_stride: usize, w: u64, out: u64, n: usize, rows: usize, eps: f32, per: usize, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()>;
+    /// `rms_norm_rope` of the q heads (`qrows` rows, `qper` per token), then `rms_norm_rope_kv` of the k heads (rows of n).
+    fn rms_norm_rope_qk(&self, q: u64, q_stride: usize, qw: u64, qo: u64, qrows: usize, qper: usize, k: u64, kw: u64, ko: u64, krows: usize, kper: usize,
+                        n: usize, eps: f32, n_rot: usize, step: u64, base: f32, v: u64, kc: u64, vc: u64) -> anyhow::Result<()> {
+        self.rms_norm_rope(q, q_stride, qw, qo, n, qrows, eps, qper, n_rot, step, base)?;
+        self.rms_norm_rope_kv(k, n, kw, ko, n, krows, eps, kper, n_rot, step, base, v, kc, vc)
+    }
+    /// x += y.
+    fn add(&self, x: u64, y: u64, n: usize) -> anyhow::Result<()>;
+    /// g = silu(g) * u.
+    fn swiglu(&self, g: u64, u: u64, n: usize) -> anyhow::Result<()>;
+    /// Beta*tanh(gate/beta) * sigmoid(gate) * lb*tanh(up/lb) as in `situ`, directly quantized as `quant_xq` into `xq`.
+    fn situ_q(&self, _y: u64, _n: usize, _rows: usize, _scale: u64, _beta: f32, _lb: f32, _xq: u64) -> anyhow::Result<()> { anyhow::bail!("{}: situ_q not implemented", self.name()) }
+    /// `x[i] = cap * tanh(x[i] / cap)` for `i < n`.
+    fn softcap(&self, _x: u64, _n: usize, _cap: f32) -> anyhow::Result<()> { anyhow::bail!("{}: softcap not implemented", self.name()) }
+    /// Inkling's activation on `rows` rows of 2n floats at `y`, n gates then n ups: each gate becomes
+    /// beta*tanh(gate/beta) * sigmoid(gate) * lb*tanh(up/lb) (`lb` not above 0: times the up as it is).
+    fn situ(&self, _y: u64, _n: usize, _rows: usize, _scale: u64, _beta: f32, _lb: f32) -> anyhow::Result<()> { anyhow::bail!("{}: SITU not implemented", self.name()) }
+    // Inkling 2's decode token and batched prefill on the device (`inkling2::device`); the host math is in `inkling2::forward`.
+    /// Depth mix: `out[j]` (n floats each, j < nq) = the softmax-weighted sum of the RMS-normed states, scored by
+    /// query row j of `q`. The states are the `nb` rows of `blocks` (the newest last) and `cur`.
+    fn ink_mix(&self, blocks: u64, nb: usize, cur: u64, q: u64, nq: usize, out: u64, n: usize) -> anyhow::Result<()> {
+        self.ink_mix_n(blocks, nb, cur, q, nq, out, n, 1)
+    }
+    /// Batched depth mix across `nt` tokens: `blocks` `[nb][nt][n]`, `cur` `[nt][n]`, `q` `[nq][n]`, `out` `[nq][nt][n]`.
+    fn ink_mix_n(&self, _blocks: u64, _nb: usize, _cur: u64, _q: u64, _nq: usize, _out: u64, _n: usize, _nt: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// `count` loop controllers: `out[j] = cur_j - tanh(forget)*cur_j + tanh(gain)*msg[j]`, `cur_j` row
+    /// `min(j, nins - 1)` of `cur`. `down` (`[rank][2n]`), `gain` and `forget` (`[rank][n]`) are f16, a controller
+    /// after another. `gate`: `count * rank` floats of scratch.
+    fn ink_ctrl(&self, down: u64, gain: u64, forget: u64, cur: u64, nins: usize, msg: u64, gate: u64, out: u64, n: usize, rank: usize, count: usize) -> anyhow::Result<()> {
+        self.ink_ctrl_n(down, gain, forget, cur, nins, msg, gate, out, n, rank, count, 1)
+    }
+    /// Batched loop controllers across `nt` tokens: `cur` `[min(nins, count)][nt][n]`, `msg`/`out` `[count][nt][n]`,
+    /// `gate` `[nt][count][rank]`.
+    fn ink_ctrl_n(&self, _down: u64, _gain: u64, _forget: u64, _cur: u64, _nins: usize, _msg: u64, _gate: u64, _out: u64, _n: usize, _rank: usize, _count: usize, _nt: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// Short causal convolution with a residual, `out` may be `cur`: weights `w` `[channel][lag]`, the last
+    /// `n_conv - 1` inputs in `hist` (advanced by `cur`), and input-dependent `taps` `[channel / per][lag]` or 0.
+    fn ink_conv(&self, _cur: u64, _w: u64, _taps: u64, _hist: u64, _out: u64, _n: usize, _n_conv: usize, _per: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// Batched short causal convolution with a residual over `nt` tokens: `cur` and `out` (`[nt][n]`) must not alias;
+    /// `taps` (`[nt][n / per][n_conv]`) may be 0. Advances `hist` by the last `n_conv - 1` inputs across `hist + cur`.
+    fn ink_conv_batch(&self, _cur: u64, _w: u64, _taps: u64, _hist: u64, _out: u64, _n: usize, _n_conv: usize, _per: usize, _nt: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 batched conv not implemented", self.name())
+    }
+    /// `rows` rows of `w` (at most 128) floats at `x`, in place: times `scale` (per value, or 0), then each row
+    /// scaled to an L2 norm of at most `thr`, or with `thr` 0 to an RMS of 1 (`eps`); then times `mul`. `dst` not 0:
+    /// the result also goes there in the active KV layout.
+    fn ink_clip(&self, x: u64, scale: u64, w: usize, rows: usize, thr: f32, eps: f32, mul: f32, dst: u64) -> anyhow::Result<()> {
+        self.ink_clip_n(x, scale, w, rows, 1, thr, eps, mul, dst, 0, 1, 0, 0.0, 1.0)
+    }
+    /// Batched `ink_clip` over `nt` tokens of `rows` rows each (`x`: `[nt][rows][w]`, `scale`: `[rows][w]` or 0).
+    /// When `dst != 0`, stores token `tok` at KV row `(dst_at0 + tok) % dst_ring`. When `log_alpha != 0.0`,
+    /// scales `mul` by `1 + log_alpha * ln(max((pos0 + tok + 1) / log_floor, 1))`.
+    fn ink_clip_n(
+        &self, _x: u64, _scale: u64, _w: usize, _rows: usize, _nt: usize,
+        _thr: f32, _eps: f32, _mul: f32,
+        _dst: u64, _dst_at0: usize, _dst_ring: usize,
+        _pos0: usize, _log_alpha: f32, _log_floor: f32,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// Graph-capturable `ink_clip_n`: reads `pos0` from device `i32` pointer `pos_ptr` (`dst_at0 = pos0 % dst_ring`).
+    fn ink_clip_pos(
+        &self, _x: u64, _scale: u64, _w: usize, _rows: usize, _nt: usize,
+        _thr: f32, _eps: f32, _mul: f32,
+        _dst: u64, _dst_ring: usize,
+        _pos_ptr: u64, _log_alpha: f32, _log_floor: f32,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// Attention of one token over `rows` key and value rows (`nkv * hd` wide in active KV format; the token's own row is `at`, the
+    /// row before it `at - 1` modulo `rows`). Logit: q.k / sqrt(hd) + r.bias[distance] (distance < `ext`) - sink, a
+    /// softmax with one more logit of 0, times sigmoid(gate). `hd` divides 128. `sc`: `nh * rows.div_ceil(64) * (hd + 2)`
+    /// floats of scratch.
+    fn ink_attn(&self, _q: u64, _r: u64, _sink: u64, _gate: u64, _k: u64, _v: u64, _bias: u64, _sc: u64, _out: u64, _rows: usize, _at: usize, _nh: usize, _nkv: usize, _hd: usize, _nr: usize, _ext: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// Graph-capturable `ink_attn`: reads `pos` from device `i32` pointer `pos_ptr`, sets `rows = min(pos + 1, ring)` and `at = pos % ring`,
+    /// dispatching `max_rows.div_ceil(64)` chunks.
+    fn ink_attn_pos(&self, _q: u64, _r: u64, _sink: u64, _gate: u64, _k: u64, _v: u64, _bias: u64, _sc: u64, _out: u64, _max_rows: usize, _ring: usize, _pos_ptr: u64, _nh: usize, _nkv: usize, _hd: usize, _nr: usize, _ext: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name()) }
+    /// Batched causal Inkling 2 attention over `nt` query tokens starting at position `pos` (`hd` 32/64/128).
+    /// When `kc_new != 0`, keys/values for `kp >= pos` read row `kp - pos` of `kc_new`/`vc_new` so SWA history `< pos` in `kc`/`vc` is preserved.
+    /// `q`/`gate`/`out`: `[nt][nh][hd]`, `r`: `[nt][nh][nr]`, `sink`: `[nt][nh]`, `bias`: `[ext][nr]`.
+    fn ink_attn_prefill(
+        &self, _q: u64, _r: u64, _sink: u64, _gate: u64, _kc: u64, _vc: u64, _kc_new: u64, _vc_new: u64, _bias: u64, _out: u64,
+        _pos: usize, _nt: usize, _nh: usize, _nkv: usize, _hd: usize, _nr: usize, _ext: usize, _ring: usize, _win: usize,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 prefill attention not implemented", self.name())
+    }
+    /// `acc[c] = (cpu ? cpu[c] : 0) + sum over e < ne of wts[e] * d[e * n + c]`.
+    fn ink_ffn_sum(&self, acc: u64, d: u64, wts: u64, ne: usize, n: usize, cpu: u64) -> anyhow::Result<()> {
+        self.ink_ffn_sum_n(acc, d, wts, ne, n, 1, cpu)
+    }
+    /// Batched `ink_ffn_sum` over `nt` tokens (`acc`/`cpu`: `[nt][n]`, `d`: `[nt][ne][n]`, `wts`: `[nt][ne]`).
+    fn ink_ffn_sum_n(&self, _acc: u64, _d: u64, _wts: u64, _ne: usize, _n: usize, _nt: usize, _cpu: u64) -> anyhow::Result<()> {
+        anyhow::bail!("{}: Inkling 2 device decode not implemented", self.name())
+    }
+    /// Inkling 2 sigmoid top-k router for `rows` tokens: picks top `k` from `logits` (`[rows, n_expert]`) using
+    /// `sigmoid(logit) + bias`, writes indices `[rows, k]` to `ids`, normalized unbiased probs * `exp_scale` (* `dn_sc[id]`
+    /// if non-null) to `wts`, and optional `gu_sc[id]` (or `1.0`) to `gsc_out`.
+    fn ink_route(&self, _logits: u64, _bias: u64, _ids: u64, _wts: u64, _gu_sc: u64, _dn_sc: u64, _gsc_out: u64, _n_expert: usize, _k: usize, _exp_scale: f32, _rows: usize) -> anyhow::Result<()> { anyhow::bail!("{}: Inkling 2 router not implemented", self.name()) }
+    /// Gyro files (`config::Hadamard`): each of `rows` rows of n floats at `x` (times silu(x) * u first when `u` is
+    /// not 0) becomes H (s x) per `block` values, written to `out`, which may be `x`. `s`: the row's n signs as floats.
+    fn hadamard(&self, _x: u64, _u: u64, _s: u64, _out: u64, _n: usize, _block: usize, _rows: usize) -> anyhow::Result<()> {
+        anyhow::bail!("this file rotates its expert inputs (prism.hadamard), which the {} backend does not do", self.name())
+    }
+    /// The SwiGLU of `rows` rows of n for a GEMV with quantized weights: either g = silu(g) * u (returns 0), or
+    /// silu(g) * u quantized into `xq` as `quant_xq` does (returns xq, for the GEMV's xq; g is then left as is).
+    fn swiglu_q(&self, g: u64, u: u64, n: usize, rows: usize, _xq: u64) -> anyhow::Result<u64> {
+        self.swiglu(g, u, rows * n)?;
+        Ok(0)
+    }
+    fn ssm_gates(&self, beta: u64, g: u64, dt_bias: u64, a: u64, n: usize, nv: usize) -> anyhow::Result<()>;
+    /// One token's causal conv and SiLU; then the first `nn` groups of 128 channels are l2-normalized as `l2_norm` does.
+    fn conv_silu(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, nn: usize, eps: f32) -> anyhow::Result<()>;
+    /// Scan `t` tokens (rows of y `ych` floats apart) through the DeltaNet state `s`.
+    /// `snap`: room for `nsnap` states; the state after each of the first min(nsnap, t - 1) tokens is kept there.
+    /// `interleave`: value head h reads key head h / (nv / nk), else h % nk.
+    /// `dt_bias` not 0: beta and g are raw, and the kernel applies `ssm_gates` (with `dt_bias` and `a`) as it reads them.
+    fn deltanet(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize) -> anyhow::Result<()>;
+    /// Stride (in tokens) between saved DeltaNet checkpoints in `snap` (`1` saves every token, `4` saves every 4th token).
+    fn delta_snap_stride(&self) -> usize { 1 }
+    fn deltanet_strided(&self, y: u64, s: u64, beta: u64, g: u64, dt_bias: u64, a: u64, o: u64, nk: usize, nv: usize, interleave: bool, dk: usize, dv: usize, scale: f32, t: usize, ych: usize, snap: u64, nsnap: usize, _snap_stride: usize) -> anyhow::Result<()> {
+        self.deltanet(y, s, beta, g, dt_bias, a, o, nk, nv, interleave, dk, dv, scale, t, ych, snap, nsnap)
+    }
+    /// Causal conv + SiLU over `t` tokens of `ch` channels, then roll the conv state forward (snapshots as in `deltanet`).
+    fn conv_seq(&self, qkv: u64, state: u64, w: u64, y: u64, ch: usize, kw: usize, t: usize, snap: u64, nsnap: usize) -> anyhow::Result<()>;
+    /// Grouped dynamic causal convolution for DFlash2 (`part = 0` prepare, `part = 1` finish).
+    fn dflash2_conv(&self, x: u64, dyn_w: u64, base: u64, out: u64, h: usize, gs: usize, k: usize, t: usize, part: usize) -> anyhow::Result<()>;
+    /// `qg` 0: no output gate.
+    fn attn_prefill(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32) -> anyhow::Result<()> {
+        self.attn_prefill_m(q, kc, vc, qg, out, step, t, nh, nkv, hd, scale, 0, 0, 0, 0)
+    }
+    /// `attn_prefill` where query row i sees only the keys whose 4-cell block has its bit set in row i of `qm` (`mw`
+    /// words a row, rows up to `t` rounded up to 64; see `qsa_select`). `qm` 0: no mask. `sink` (0 = none): per-head
+    /// attention-sink logits. `win` (0 = none): sliding-window width.
+    fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize, sink: u64, win: usize) -> anyhow::Result<()>;
+    /// QSA indexer keys (see `Model::qsa`): pool the blocks of 4 positions that the `t` raw keys (rows of 128) at
+    /// positions step[0] .. complete into `pool` (rows of 128 per block: mean, rms norm with `w`, NEOX rope at the
+    /// block's first position). `ring`: 4 rows of 128, the raw keys of the incomplete block (row = position % 4).
+    fn qsa_pool(&self, _ik: u64, _ring: u64, _pool: u64, _w: u64, _step: u64, _t: usize, _n_rot: usize, _base: f32, _eps: f32) -> anyhow::Result<()> {
+        anyhow::bail!("{}: QSA sparse attention not implemented", self.name())
+    }
+    /// QSA block selection for `rows` query rows at positions step[0] + r0 + i (rows of 4 normed, roped heads of 128 in
+    /// `q`): scores into `score` (rows of `nbs`), then either cell lists into `sel` (rows of `sst` ints, `mw` 0) for
+    /// `attn_decode_q`, or block masks into `mask` (rows of `mw` words) for `attn_prefill_m`. `top`: blocks kept.
+    fn qsa_select(&self, _q: u64, _pool: u64, _score: u64, _sel: u64, _mask: u64, _step: u64, _r0: usize, _rows: usize, _nbs: usize, _top: usize, _sst: usize, _mw: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: QSA sparse attention not implemented", self.name())
+    }
+    fn moe_combine_seq(&self, x: u64, ye: u64, wts: u64, inv: u64, k: usize, sh: u64, sg: u64, n: usize, t: usize) -> anyhow::Result<()>;
+    fn norm_gate(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32) -> anyhow::Result<()>;
+    /// `norm_gate`, then either returns 0, or also writes o (all heads of a token as one row) quantized as `quant_xq`
+    /// does to `xq` and returns xq, for the GEMV's xq.
+    fn norm_gate_q(&self, o: u64, w: u64, z: u64, n: usize, heads: usize, eps: f32, _xq: u64) -> anyhow::Result<u64> {
+        self.norm_gate(o, w, z, n, heads, eps)?;
+        Ok(0)
+    }
+    /// `norm_gate_q` gating with sigmoid(z) in place of silu(z) (qwen4exp).
+    fn norm_gate_sig(&self, _o: u64, _w: u64, _z: u64, _n: usize, _heads: usize, _eps: f32, _xq: u64) -> anyhow::Result<u64> {
+        anyhow::bail!("{}: sigmoid-gated norm not implemented", self.name())
+    }
+    // qwen4exp hyper-connections (see `Model::hc_read`); the residual of a token is hc rows of n.
+    /// x = silu(x * sc) over n values.
+    fn hc_silu(&self, _x: u64, _sc: f32, _n: usize) -> anyhow::Result<()> { anyhow::bail!("{}: hyper-connections not implemented", self.name()) }
+    /// out[t] = sum over streams c of xn[t][c] * sigmoid(g[t][c]) / hc, for t < nt.
+    fn hc_mix(&self, _xn: u64, _g: u64, _out: u64, _n: usize, _hc: usize, _nt: usize) -> anyhow::Result<()> { anyhow::bail!("{}: hyper-connections not implemented", self.name()) }
+    /// Stream c of r[t] += out[t] * 2 sigmoid(inj[t][c] / hc), for t < nt; `clear`: zero out afterwards.
+    fn hc_write(&self, _r: u64, _out: u64, _inj: u64, _n: usize, _hc: usize, _nt: usize, _clear: bool) -> anyhow::Result<()> { anyhow::bail!("{}: hyper-connections not implemented", self.name()) }
+    /// PLE gate (see `Model::ple`): key and query rows of hc * n per token, value rows of n.
+    fn ple_gate(&self, _key: u64, _query: u64, _value: u64, _gated: u64, _n: usize, _hc: usize, _nt: usize) -> anyhow::Result<()> { anyhow::bail!("{}: PLE not implemented", self.name()) }
+    /// PLE conv and residual add for nt tokens at positions step[0] .. (rows of d); `ring`: 16 rows of d.
+    fn ple_conv(&self, _r: u64, _gated: u64, _norm: u64, _kw: u64, _ring: u64, _step: u64, _d: usize, _nt: usize) -> anyhow::Result<()> { anyhow::bail!("{}: PLE not implemented", self.name()) }
+    /// Store `t` tokens of `n` values at positions step[0] ...
+    fn kv_store(&self, k: u64, v: u64, kc: u64, vc: u64, n: usize, t: usize, step: u64, hd: usize) -> anyhow::Result<()>;
+    /// Decode attention for `nt` query tokens, token t over positions 0 ..= step[2 t] (rows of q, qg, out and step per
+    /// token, `part` holds `nh * ATT_SPLITS * (hd + 2)` floats per token). `qg` 0: no output gate.
+    fn attn_decode(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, nt: usize) -> anyhow::Result<()> {
+        self.attn_decode_gq(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, ATT_GQA_MIN, nt, 0, 0)
+    }
+    /// `attn_decode_gq`, also writing `out` quantized for `gemvq` into `xq` where supported; returns the xq to use (0: none).
+    /// `sel` not 0: QSA cell lists from `qsa_select` (rows of `sst` ints per token). `sink` (0 = none): per-head
+    /// attention-sink logits. `win` (0 = none): sliding-window width.
+    fn attn_decode_q(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, _xq: u64, sel: u64, _sst: usize, sink: u64, win: usize) -> anyhow::Result<u64> {
+        anyhow::ensure!(sel == 0, "{}: QSA sparse attention not implemented", self.name());
+        self.attn_decode_gq(q, kc, vc, qg, out, part, step, nh, nkv, hd, scale, gq_min, nt, sink, win)?;
+        Ok(0)
+    }
+    /// Whether `rms_norm_rope_qk_rows` and `attn_rows` exist here (`GpuModel::step_batch` needs them).
+    fn kv_rows(&self) -> bool { false }
+    /// `rms_norm_rope_qk` for `nt` tokens of different sequences: token t is at position `step[2t]` and stores its K
+    /// and V in the caches whose addresses are `kvt[2t]` and `kvt[2t + 1]` (u64 each).
+    fn rms_norm_rope_qk_rows(&self, _q: u64, _q_stride: usize, _qw: u64, _qo: u64, _nh: usize, _k: u64, _kw: u64, _ko: u64, _nkv: usize, _hd: usize, _eps: f32, _n_rot: usize,
+                             _step: u64, _base: f32, _v: u64, _kvt: u64, _nt: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: no per-row KV kernels", self.name())
+    }
+    /// `attn_decode_gq` with `gq_min` 0 for `nt` tokens of different sequences, with the caches of
+    /// `rms_norm_rope_qk_rows`; `part` holds `nt` rows of the split partials. `splits` (1 ..= ATT_SPLITS): blocks a
+    /// head group; many short rows run faster with few.
+    fn attn_rows(&self, _q: u64, _qg: u64, _out: u64, _part: u64, _step: u64, _nh: usize, _nkv: usize, _hd: usize, _scale: f32, _nt: usize, _sink: u64, _win: usize, _kvt: u64,
+                 _splits: usize) -> anyhow::Result<()> {
+        anyhow::bail!("{}: no per-row KV kernels", self.name())
+    }
+    /// `attn_decode` that shares K/V loads across a GQA group from `gq_min` positions on (tests use 0 to force it).
+    fn attn_decode_gq(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, part: u64, step: u64, nh: usize, nkv: usize, hd: usize, scale: f32, gq_min: i32, nt: usize, sink: u64, win: usize) -> anyhow::Result<()>;
+    /// Route `t` tokens (logit rows of n, ids / wts rows of k). `sigmoid` selects sigmoid scores instead of softmax.
+    fn router_topk(&self, p: u64, n: usize, k: usize, extra_scale: f32, ids: u64, wts: u64, t: usize, sigmoid: bool) -> anyhow::Result<()>;
+    /// Decode routing: `router_topk`, the expert cache lookup (slots[j] = table[ids[j]], -1 = not resident; wh[j] =
+    /// wts[j] on a hit, else 0), then the routing and (on a miss) `h` (rows of nh) written to the layer mailbox at
+    /// `mb` and its request flag raised. `mb` = 0 skips every mailbox store where `moe_mailbox_optional` holds. `pid`
+    /// (0 = none) receives the last token's ids, the prediction the next token's prefetch uses.
+    fn moe_route(&self, p: u64, n: usize, k: usize, extra_scale: f32, table: u64, ids: u64, wts: u64, slots: u64, wh: u64, h: u64, mb: u64, nh: usize, h_off: usize, step: u64, t: usize, pid: u64, sigmoid: bool) -> anyhow::Result<()>;
+    /// `mb` = 0: no CPU part. Otherwise adds the CPU result at word `y_off` of the mailbox once its done flag is `seq`.
+    fn moe_combine(&self, x: u64, ye: u64, w: u64, k: usize, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, slots: u64, n: usize, t: usize) -> anyhow::Result<()>;
+    /// Whether `moe_route`/`moe_combine` accept `mb = 0`, i.e. a fully resident expert cache costs the CPU worker
+    /// nothing (no mailbox traffic at all). False where the kernels read the mailbox unconditionally (Vulkan).
+    /// Most tokens of one `gemvn`/verify forward: 4 unless the backend's kernels take `cpu_worker::TMAX`.
+    fn verify_rows(&self) -> usize { 4 }
+    fn moe_mailbox_optional(&self) -> bool { false }
+
+    /// Whether `moe_prefetch` does anything here (CUDA: yes; Vulkan: no kernel, the knob is ignored).
+    fn moe_prefetch_supported(&self) -> bool { false }
+
+    /// Hint into L2 the cached slots of the experts `ids` of a layer (`table` maps expert to slot, -1 = on the CPU):
+    /// `STRATA_MOE_PREFETCH`, a performance knob only. A no-op where `moe_prefetch_supported` is false.
+    fn moe_prefetch(&self, ids: u64, k: usize, table: u64, base: u64, stride: usize, bytes: usize) -> anyhow::Result<()> {
+        let _ = (ids, k, table, base, stride, bytes);
+        Ok(())
+    }
+
+    /// `moe_gemv` of the down experts (`k` slots per token, x pre-quantized at `xq` when not 0) into `ye`, then
+    /// `moe_combine` of ye into x.
+    fn moe_down_combine(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, slots: u64, k: usize, h: u64, ye: u64, xq: u64,
+                        x: u64, wh: u64, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
+        self.moe_gemv(ty, rows, cols, w, stride, slots, t * k, h, cols, 1, ye, None, xq)?;
+        self.moe_combine(x, ye, wh, k, sh, sg, mb, y_off, step, slots, rows, t)
+    }
+}
+
+/// Typed copies. Positions and counts are in elements of `T`.
+impl<'a> dyn Backend + 'a {
+    /// Zeroed buffer of `n` values of `T`.
+    pub fn zeros<T: Plain>(&self, n: usize) -> anyhow::Result<Buf> { self.alloc(n * size_of::<T>()) }
+
+    /// Copy `src` into `dst` from element `at` on.
+    pub fn put<T: Plain>(&self, src: &[T], dst: &Buf, at: usize) -> anyhow::Result<()> {
+        let b = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), size_of_val(src)) };
+        self.htod(b, dst, at * size_of::<T>())
+    }
+
+    /// `n` values of `T` from `src`, starting at element `at`.
+    pub fn get<T: Plain>(&self, src: &Buf, at: usize, n: usize) -> anyhow::Result<Vec<T>> {
+        let mut v = vec![T::default(); n];
+        let b = unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<u8>(), n * size_of::<T>()) };
+        self.dtoh(src, at * size_of::<T>(), b)?;
+        Ok(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_devices, device_order};
+
+    #[test]
+    fn hip_refuses_a_device_split_and_nothing_else() {
+        assert!(check_devices(Some("hip"), &[0, 1]).is_err());
+        assert!(check_devices(Some("hip"), &[0]).is_ok());
+        assert!(check_devices(Some("cuda"), &[0, 1]).is_ok());
+        assert!(check_devices(None, &[0, 1]).is_ok());
+    }
+
+    /// Identifiers are letters here. Two cards of one model have one name and two identifiers, so names play no part.
+    #[test]
+    fn a_gpu_index_is_the_same_card_on_cuda_and_vulkan() {
+        // CUDA counts the faster card first, Vulkan in bus order (the 5060 Ti and 3060 of the report).
+        assert_eq!(device_order(&[Some('T'), Some('S')], &['S', 'T']), [Some(1), Some(0)]);
+        // Two cards of the same model, and an integrated GPU that CUDA does not know: it follows the CUDA devices.
+        assert_eq!(device_order(&[Some('B'), Some('A')], &['A', 'I', 'B']), [Some(2), Some(0), Some(1)]);
+        // CUDA device 0 is not usable on Vulkan (filtered out): index 0 fails, index 1 is still CUDA's card 1.
+        assert_eq!(device_order(&[Some('A'), Some('B')], &['B']), [None, Some(0)]);
+        // A CUDA device without identifier takes the first Vulkan device that no CUDA device names.
+        assert_eq!(device_order(&[None, Some('B')], &['B', 'A']), [Some(1), Some(0)]);
+        // No CUDA (AMD, Intel, llvmpipe), or no identifier at all: Vulkan's own order, as before.
+        assert_eq!(device_order(&[], &['A', 'B']), [Some(0), Some(1)]);
+        assert_eq!(device_order(&[None, None], &['A', 'B']), [Some(0), Some(1)]);
+        assert_eq!(device_order::<char>(&[Some('A')], &[]), [None]);
+    }
+}
+// ==== /z/ai-models/rs-v131wt/src/chat.rs
+//! Chat templates. Renders OpenAI-style messages and tools as llama.cpp's Jinja engine renders the model's
+//! `tokenizer.chat_template`, and parses tool calls out of a reply. Two template families are covered, picked by
+//! markers in the template text: Qwen3.6 (`<function=..>` XML calls) and Qwen3 2507 / Qwen3-Next (JSON calls).
+//! `tests/serve.rs` checks the output byte for byte against llama-server's `/apply-template`.
+
+use anyhow::{Context, bail};
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+
+/// A JSON value that keeps object key order. serde_json's `Map` sorts keys without its `preserve_order` feature,
+/// and templates print tools and arguments in the client's order.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Json { Null, Bool(bool), Num(serde_json::Number), Str(String), Arr(Vec<Json>), Obj(Vec<(String, Json)>) }
+
+static NULL: Json = Json::Null;
+
+impl Json {
+    /// Field `k` of an object; null when missing or not an object.
+    pub fn get(&self, k: &str) -> &Json {
+        match self { Json::Obj(o) => o.iter().find(|(x, _)| x == k).map_or(&NULL, |x| &x.1), _ => &NULL }
+    }
+    pub fn as_str(&self) -> Option<&str> { if let Json::Str(s) = self { Some(s) } else { None } }
+    /// Jinja's `tojson` as llama.cpp prints it: `", "` and `": "` separators, non-ASCII kept, floats as C `%g`.
+    pub fn dump(&self) -> String {
+        let mut s = String::new();
+        self.dump_to(&mut s);
+        s
+    }
+    fn dump_to(&self, s: &mut String) {
+        let key = |k: &str| serde_json::to_string(k).unwrap();
+        match self {
+            Json::Null => s.push_str("null"),
+            Json::Bool(b) => s.push_str(if *b { "true" } else { "false" }),
+            Json::Num(n) => s.push_str(&num(n)),
+            Json::Str(x) => s.push_str(&key(x)),
+            Json::Arr(a) => {
+                s.push('[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 { s.push_str(", "); }
+                    v.dump_to(s);
+                }
+                s.push(']');
+            }
+            Json::Obj(o) => {
+                s.push('{');
+                for (i, (k, v)) in o.iter().enumerate() {
+                    if i > 0 { s.push_str(", "); }
+                    s.push_str(&key(k));
+                    s.push_str(": ");
+                    v.dump_to(s);
+                }
+                s.push('}');
+            }
+        }
+    }
+    /// A tool-call parameter value as the Qwen3.6 template prints it: lists and objects as JSON, other values
+    /// through Jinja's `string` filter (Python spelling for booleans and null).
+    fn param(&self) -> String {
+        match self {
+            Json::Str(s) => s.clone(),
+            Json::Bool(b) => (if *b { "True" } else { "False" }).into(),
+            Json::Null => "None".into(),
+            Json::Num(n) => num(n),
+            _ => self.dump(),
+        }
+    }
+}
+
+/// Number text: integers exact, floats like C's `%g` (6 significant digits), which is what llama.cpp prints.
+fn num(n: &serde_json::Number) -> String {
+    let Some(f) = n.as_f64().filter(|_| n.is_f64()) else { return n.to_string() };
+    if f == 0.0 { return (if f.is_sign_negative() { "-0" } else { "0" }).into(); }
+    let strip = |s: &str| if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s.to_string() };
+    let e = format!("{f:.5e}");
+    let (m, x) = e.split_once('e').unwrap();
+    let x: i32 = x.parse().unwrap();
+    if (-4..6).contains(&x) { strip(&format!("{f:.*}", (5 - x) as usize)) }
+    else { format!("{}e{}{:02}", strip(m), if x < 0 { '-' } else { '+' }, x.abs()) }
+}
+
+impl<'de> Deserialize<'de> for Json {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Json, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Json;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("JSON") }
+            fn visit_unit<E>(self) -> Result<Json, E> { Ok(Json::Null) }
+            fn visit_bool<E>(self, b: bool) -> Result<Json, E> { Ok(Json::Bool(b)) }
+            fn visit_i64<E>(self, n: i64) -> Result<Json, E> { Ok(Json::Num(n.into())) }
+            fn visit_u64<E>(self, n: u64) -> Result<Json, E> { Ok(Json::Num(n.into())) }
+            fn visit_f64<E: serde::de::Error>(self, f: f64) -> Result<Json, E> {
+                serde_json::Number::from_f64(f).map(Json::Num).ok_or_else(|| E::custom("bad number"))
+            }
+            fn visit_str<E>(self, s: &str) -> Result<Json, E> { Ok(Json::Str(s.into())) }
+            fn visit_string<E>(self, s: String) -> Result<Json, E> { Ok(Json::Str(s)) }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Json, A::Error> {
+                let mut v = Vec::new();
+                while let Some(x) = a.next_element()? { v.push(x); }
+                Ok(Json::Arr(v))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Json, A::Error> {
+                let mut v: Vec<(String, Json)> = Vec::new();
+                // Key positions, so a body with many keys parses in linear time.
+                let mut at = std::collections::HashMap::<String, usize>::new();
+                while let Some((k, x)) = a.next_entry::<String, Json>()? {
+                    // A repeated key keeps its first place and its last value, as in nlohmann's ordered_json.
+                    match at.get(&k) { Some(&i) => v[i].1 = x, None => { at.insert(k.clone(), v.len()); v.push((k, x)) } }
+                }
+                Ok(Json::Obj(v))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// One chat message. `content` is already text (content parts joined with newlines, as llama.cpp does), with one
+/// `<image>` placeholder per image in `images`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Msg { pub role: String, pub content: String, pub reasoning: Option<String>, pub calls: Vec<Call>, pub images: Vec<String> }
+
+/// A tool call in an assistant message; `args` is the parsed arguments object.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Call { pub name: String, pub args: Json }
+
+impl Msg {
+    pub fn new(role: &str, content: &str) -> Msg { Msg { role: role.into(), content: content.into(), reasoning: None, calls: vec![], images: vec![] } }
+
+    /// Parses one OpenAI message. Roles are limited to the ones the templates know, because the role goes into the
+    /// prompt verbatim.
+    pub fn from_json(m: &Json) -> anyhow::Result<Msg> {
+        let role = m.get("role").as_str().context("message without role")?;
+        if !["system", "user", "assistant", "tool"].contains(&role) { bail!("unknown role {role:?}"); }
+        let mut images = vec![];
+        let content = match m.get("content") {
+            Json::Str(s) => s.clone(),
+            Json::Arr(parts) => {
+                let mut text = String::new();
+                let mut first = true;
+                for p in parts {
+                    let piece = match p.get("type").as_str().unwrap_or("") {
+                        "text" => p.get("text").as_str().unwrap_or("").to_string(),
+                        "image_url" => {
+                            let u = p.get("image_url");
+                            let url = u.get("url").as_str().or_else(|| u.as_str()).unwrap_or("");
+                            if url.is_empty() { continue; }
+                            images.push(url.to_string());
+                            "<image>".to_string()
+                        }
+                        "image" => {
+                            let src = p.get("source");
+                            let url = src.get("url").as_str().map(str::to_owned).or_else(|| {
+                                (src.get("type").as_str() == Some("base64")).then(|| {
+                                    format!("data:{};base64,{}", src.get("media_type").as_str().unwrap_or("image/png"), src.get("data").as_str().unwrap_or(""))
+                                })
+                            });
+                            let Some(url) = url.filter(|u| !u.is_empty() && !u.ends_with(";base64,")) else { continue };
+                            images.push(url);
+                            "<image>".to_string()
+                        }
+                        _ => continue,
+                    };
+                    if !first { text.push('\n'); }
+                    text.push_str(&piece);
+                    first = false;
+                }
+                text
+            }
+            Json::Null if role == "assistant" => String::new(),
+            Json::Null => bail!("{role} message without content"),
+            _ => bail!("bad content"),
+        };
+        // Messages come from the network: a plain path would make the server read a local file.
+        if let Some(u) = images.iter().find(|u| !["data:", "http://", "https://"].iter().any(|p| u.starts_with(p))) {
+            bail!("image source {u:?} is not a data: or http(s) URL");
+        }
+        let calls = match m.get("tool_calls") {
+            Json::Null => vec![],
+            Json::Arr(a) if role == "assistant" => a.iter().map(|c| {
+                let f = c.get("function");
+                let name = f.get("name").as_str().context("tool call without function name")?.to_string();
+                // llama.cpp parses string arguments, so both families print them as JSON.
+                let args = match f.get("arguments") {
+                    Json::Str(s) => serde_json::from_str(s).context("tool call arguments are not valid JSON")?,
+                    Json::Null => bail!("tool call without arguments"),
+                    a => a.clone(),
+                };
+                Ok(Call { name, args })
+            }).collect::<anyhow::Result<_>>()?,
+            _ => bail!("tool_calls must be an array on an assistant message"),
+        };
+        Ok(Msg { role: role.into(), content, reasoning: m.get("reasoning_content").as_str().map(Into::into), calls, images })
+    }
+}
+
+/// A tool as llama.cpp hands it to the template: the type, then the function's name, description and parameters,
+/// nothing else.
+pub fn tool_def(t: &Json) -> anyhow::Result<Json> {
+    if !matches!(t.get("type"), Json::Null) && t.get("type").as_str() != Some("function") { bail!("tool type must be \"function\""); }
+    let f = t.get("function");
+    let name = f.get("name").as_str().context("tool without function name")?;
+    let or = |v: &Json, d: Json| if matches!(v, Json::Null) { d } else { v.clone() };
+    Ok(Json::Obj(vec![("type".into(), Json::Str("function".into())), ("function".into(), Json::Obj(vec![
+        ("name".into(), Json::Str(name.into())),
+        ("description".into(), or(f.get("description"), Json::Str(String::new()))),
+        ("parameters".into(), or(f.get("parameters"), Json::Obj(vec![]))),
+    ]))]))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Template {
+    /// Qwen3.6: `<function=name><parameter=key>` calls, contents trimmed, an empty think block when thinking is off.
+    Xml,
+    /// Qwen3 2507 and Qwen3-Next: `{"name": .., "arguments": ..}` calls. `reasoning` (2507) puts the turns after the
+    /// last user query in a think block.
+    Json { reasoning: bool },
+    /// DeepSeek-V4.1: `<｜User｜>`/`<｜Assistant｜>` turns, think mode with a reasoning-effort line. Plain chat only;
+    // ponytail: no DSML tool calls, add when serving DeepSeek tools matters.
+    Ds,
+    /// Recursive Flint: `<|system|>`/`<|user|>`/`<|assistant|>`/`<|observation|>` turns and compact
+    /// `<tool_call>name<arg_key>..</arg_key><arg_value>..</arg_value></tool_call>` calls.
+    Flint,
+}
+
+const XML_RULES: &str = "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+const JSON_HEAD: &str = "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>";
+const JSON_TAIL: &str = "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n";
+const TAG: &str = "<tool_call>";
+
+const DS_TOOLS_HEAD: &str = "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n";
+const DS_TOOLS_TAIL: &str = "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n";
+const DS_CALLS: &str = "<｜DSML｜ calls>";
+
+/// DeepSeek-V4.1 (Unsloth template): tool results merge into the user turn, the tools go after the system text
+/// (a new empty system message when there is none), and tools anywhere keep the reasoning of earlier turns.
+// ponytail: tool results print in message order; the template re-sorts them by tool_call_id (Msg keeps no ids).
+fn render_ds(msgs: &[Msg], tools: &[Json], think: bool, preserve: bool, generate: bool) -> String {
+    enum It<'a> { Sys(&'a str), User(Vec<String>, bool), Asst(&'a Msg) }
+    let mut items: Vec<It> = vec![];
+    if !tools.is_empty() && msgs.first().is_none_or(|m| m.role != "system") { items.push(It::Sys("")); }
+    for m in msgs {
+        match m.role.as_str() {
+            "tool" => {
+                let p = format!("<tool_result>{}</tool_result>", m.content);
+                match items.last_mut() { Some(It::User(v, _)) => v.push(p), _ => items.push(It::User(vec![p], false)) }
+            }
+            "user" => match items.last_mut() {
+                Some(It::User(v, real)) => { v.push(m.content.clone()); *real = true }
+                _ => items.push(It::User(vec![m.content.clone()], true)),
+            },
+            "assistant" => items.push(It::Asst(m)),
+            "system" => items.push(It::Sys(&m.content)),
+            _ => {}
+        }
+    }
+    let last_user = items.iter().rposition(|x| matches!(x, It::User(_, true)) || matches!(x, It::Sys(_))).filter(|&i| i > 0 || matches!(items[0], It::User(..))).map_or(-1, |i| i as i64);
+    let keep_all = preserve || !tools.is_empty();
+    let mut s = String::from("<｜begin▁of▁sentence｜>");
+    for (i, it) in items.iter().enumerate() {
+        if i == 0 {
+            if think || matches!(it, It::Sys(_)) { s += "<｜System｜>"; }
+            if think { s += "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"; }
+        }
+        match it {
+            It::Sys(c) => {
+                if i > 0 { s += "<｜System｜>"; }
+                s += c;
+                if i == 0 && !tools.is_empty() {
+                    s += "\n\n";
+                    s += DS_TOOLS_HEAD;
+                    s += &tools.iter().map(|t| t.get("function").dump()).collect::<Vec<_>>().join("\n");
+                    s += DS_TOOLS_TAIL;
+                }
+            }
+            It::User(v, _) => { s += "<｜User｜>"; s += &v.join("\n\n"); }
+            It::Asst(m) => {
+                let (r, c) = split_think(m, &m.content);
+                if think && (keep_all || i as i64 > last_user) { s += r; s += "</think>"; }
+                s += c;
+                if !m.calls.is_empty() {
+                    let inv: Vec<String> = m.calls.iter().map(|call| {
+                        let params: Vec<String> = match &call.args {
+                            Json::Obj(o) => o.iter().map(|(k, v)| format!("<｜DSML｜ parameter name=\"{k}\" string=\"{}\">{}</｜DSML｜ parameter>",
+                                v.as_str().is_some(), v.as_str().map_or_else(|| v.dump(), String::from))).collect(),
+                            _ => vec![],
+                        };
+                        format!("<｜DSML｜ invoke name=\"{}\">\n{}\n</｜DSML｜ invoke>", call.name, params.join("\n"))
+                    }).collect();
+                    s += &format!("\n\n{DS_CALLS}\n{}\n</｜DSML｜ calls>", inv.join("\n"));
+                }
+                s += "<｜end▁of▁sentence｜>";
+            }
+        }
+        let last = i + 1 == items.len();
+        if (last || matches!(items[i + 1], It::Asst(_))) && (matches!(it, It::User(..)) || (matches!(it, It::Sys(_)) && i > 0)) && (generate || !last) {
+            s += "<｜Assistant｜>";
+            s += if think && (keep_all || i as i64 >= last_user) { "<think>" } else { "</think>" };
+        }
+    }
+    s
+}
+
+/// Recursive Flint: escape the template's own markers in user text and drop NULs and think tags.
+fn flint_text(s: &str) -> String {
+    let mut t = s.replace('\0', "").replace(" thinking", "").replace("</think>", "");
+    for m in ["<|begin_of_text|>", "<|end_of_text|>", "<|system|>", "<|developer|>", "<|user|>", "<|assistant|>", "<|observation|>"] {
+        t = t.replace(m, &m.replace('<', "&lt;").replace('>', "&gt;"));
+    }
+    t
+}
+
+/// The tool block Flint puts in a system turn before the first non-system message.
+fn flint_preamble(tools: &[Json]) -> String {
+    let mut s = String::from("<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>");
+    for t in tools {
+        s += &t.dump();
+    }
+    s += "</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value>...</tool_call>";
+    s
+}
+
+/// Flint's chat template: turn markers with no trailing newline, `<tool_call>` calls and an always-on think block.
+fn render_flint(msgs: &[Msg], tools: &[Json], generate: bool) -> String {
+    let preamble = flint_preamble(tools);
+    let mut pending = !tools.is_empty();
+    let mut s = String::new();
+    for m in msgs {
+        if pending && m.role != "system" {
+            s += &preamble;
+            pending = false;
+        }
+        match m.role.as_str() {
+            "system" => { s += "<|system|>"; s += &flint_text(&m.content); }
+            "developer" => { s += "<|developer|>"; s += &flint_text(&m.content); }
+            "user" => { s += "<|user|>"; s += &flint_text(&m.content); }
+            "assistant" => {
+                s += "<|assistant|>";
+                let (r, c) = split_think(m, &m.content);
+                let reasoning = m.reasoning.as_deref().unwrap_or(r);
+                if !reasoning.is_empty() { s += " thinking"; s += reasoning; s += "</think>"; }
+                s += c;
+                for call in &m.calls {
+                    s += "<tool_call>";
+                    s += &call.name;
+                    if let Json::Obj(o) = &call.args {
+                        for (k, v) in o {
+                            s += "<arg_key>";
+                            s += k;
+                            s += "</arg_key><arg_value>";
+                            match v { Json::Str(x) => s += x, _ => s += &v.dump() }
+                            s += "</arg_value>";
+                        }
+                    }
+                    s += "</tool_call>";
+                }
+            }
+            "tool" => { s += "<|observation|><tool_response>"; s += &flint_text(&m.content); s += "</tool_response>"; }
+            _ => {}
+        }
+    }
+    if pending { s += &preamble; }
+    if generate { s += "<|assistant|>"; }
+    s
+}
+
+/// One `<arg_value>` as JSON text. Values that parse as JSON keep their type; anything else is a string.
+fn flint_arg(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw).map_or_else(|_| serde_json::to_string(raw).unwrap(), |v| v.to_string())
+}
+
+/// Flint reply calls: `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`.
+fn flint_calls(text: &str) -> Option<(String, Vec<(String, String)>)> {
+    let from = text.rfind("</think>").map_or(0, |p| p + 8);
+    let start = from + text[from..].find(TAG)?;
+    let mut rest = &text[start..];
+    let mut calls = Vec::new();
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() { break; }
+        let (body, tail) = rest.strip_prefix(TAG)?.split_once("</tool_call>")?;
+        rest = tail;
+        let at = body.find("<arg_key>").unwrap_or(body.len());
+        let name = body[..at].trim();
+        if name.is_empty() { return None; }
+        let mut args = String::from("{");
+        let mut b = &body[at..];
+        let mut first = true;
+        while let Some(x) = b.strip_prefix("<arg_key>") {
+            let (k, x) = x.split_once("</arg_key>")?;
+            let x = x.strip_prefix("<arg_value>")?;
+            let (v, x) = x.split_once("</arg_value>")?;
+            b = x;
+            if !first { args.push(','); }
+            first = false;
+            args += &serde_json::to_string(k.trim()).ok()?;
+            args.push(':');
+            args += &flint_arg(v);
+        }
+        if !b.trim().is_empty() { return None; }
+        args.push('}');
+        calls.push((name.to_string(), args));
+    }
+    Some((text[..start].trim_end().to_string(), calls))
+}
+
+/// Index of the last user turn that is not a tool response (the templates' `last_query_index`).
+fn last_query(msgs: &[Msg], trim: bool) -> usize {
+    msgs.iter().rposition(|m| {
+        let c = if trim { m.content.trim() } else { &m.content };
+        m.role == "user" && !(c.starts_with("<tool_response>") && c.ends_with("</tool_response>"))
+    }).unwrap_or(msgs.len().saturating_sub(1))
+}
+
+/// Reasoning and answer of an assistant turn: `reasoning_content` when given, else the `<think>` part of `c`.
+fn split_think<'a>(m: &'a Msg, c: &'a str) -> (&'a str, &'a str) {
+    if let Some(r) = &m.reasoning { return (r, c); }
+    if !c.contains("</think>") { return ("", c); }
+    let r = c.split("</think>").next().unwrap().trim_end_matches('\n').rsplit("<think>").next().unwrap();
+    (r.trim_start_matches('\n'), c.rsplit("</think>").next().unwrap().trim_start_matches('\n'))
+}
+
+impl Template {
+    /// The family of a GGUF's `tokenizer.chat_template`. Files without one get Qwen3.6's format.
+    pub fn detect(src: Option<&str>) -> Template {
+        match src {
+            Some(s) if s.contains("｜DSML｜") => Template::Ds,
+            Some(s) if s.contains("<|observation|>") && s.contains("<|begin_of_text|>") => Template::Flint,
+            Some(s) if !s.contains("<function=") && s.contains(TAG) => Template::Json { reasoning: s.contains("reasoning_content") },
+            _ => Template::Xml,
+        }
+    }
+
+    /// The prompt for `msgs` and `tools` (from `tool_def`). `generate` adds the assistant header the reply follows;
+    /// `think` false closes the think block at once where the template has one. `preserve` prints the think block of
+    /// every earlier reply, not only of those after the last user turn (Qwen3.6's `preserve_thinking`), so a new user
+    /// turn leaves the text of the earlier ones as it was and their cached state can be reused.
+    pub fn render(&self, msgs: &[Msg], tools: &[Json], think: bool, preserve: bool, generate: bool) -> String {
+        let mut s = String::new();
+        let tool_end = |s: &mut String, i: usize| {
+            if i + 1 == msgs.len() || msgs[i + 1].role != "tool" { *s += "<|im_end|>\n"; }
+        };
+        match *self {
+            Template::Flint => s += &render_flint(msgs, tools, generate),
+            Template::Ds => s += &render_ds(msgs, tools, think, preserve, generate),
+            Template::Xml => {
+                let (n_sys, sys) = match msgs {
+                    [a, b, ..] if a.role == "system" && b.role == "system" => (2, format!("{}\n{}", a.content.trim(), b.content.trim())),
+                    [a, ..] if a.role == "system" => (1, a.content.trim().to_string()),
+                    _ => (0, String::new()),
+                };
+                if !tools.is_empty() {
+                    s += "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>";
+                    for t in tools { s += "\n"; s += &t.dump(); }
+                    s += "\n</tools>";
+                    s += XML_RULES;
+                    if !sys.is_empty() { s += "\n\n"; s += &sys; }
+                    s += "<|im_end|>\n";
+                } else if !sys.is_empty() {
+                    s += &format!("<|im_start|>system\n{sys}<|im_end|>\n");
+                }
+                let lq = last_query(msgs, true);
+                for (i, m) in msgs.iter().enumerate().skip(n_sys) {
+                    let c = m.content.trim();
+                    match m.role.as_str() {
+                        "user" => s += &format!("<|im_start|>user\n{c}<|im_end|>\n"),
+                        "assistant" => {
+                            let (r, c) = split_think(m, c);
+                            if preserve || i > lq { s += &format!("<|im_start|>assistant\n<think>\n{}\n</think>\n\n{c}", r.trim()); }
+                            else { s += &format!("<|im_start|>assistant\n{c}"); }
+                            for (k, call) in m.calls.iter().enumerate() {
+                                s += if k > 0 { "\n" } else if c.trim().is_empty() { "" } else { "\n\n" };
+                                s += &format!("<tool_call>\n<function={}>\n", call.name);
+                                if let Json::Obj(o) = &call.args {
+                                    for (k, v) in o { s += &format!("<parameter={k}>\n{}\n</parameter>\n", v.param()); }
+                                }
+                                s += "</function>\n</tool_call>";
+                            }
+                            s += "<|im_end|>\n";
+                        }
+                        "tool" => {
+                            if i > 0 && msgs[i - 1].role != "tool" { s += "<|im_start|>user"; }
+                            s += &format!("\n<tool_response>\n{c}\n</tool_response>");
+                            tool_end(&mut s, i);
+                        }
+                        _ => {}  // later system messages are dropped
+                    }
+                }
+                if generate { s += if think { "<|im_start|>assistant\n<think>\n" } else { "<|im_start|>assistant\n<think>\n\n</think>\n\n" }; }
+            }
+            Template::Json { reasoning } => {
+                let sys = msgs.first().filter(|m| m.role == "system").map(|m| m.content.as_str());
+                if !tools.is_empty() {
+                    s += "<|im_start|>system\n";
+                    if let Some(c) = sys { s += c; s += "\n\n"; }
+                    s += JSON_HEAD;
+                    for t in tools { s += "\n"; s += &t.dump(); }
+                    s += JSON_TAIL;
+                } else if let Some(c) = sys {
+                    s += &format!("<|im_start|>system\n{c}<|im_end|>\n");
+                }
+                let lq = last_query(msgs, false);
+                for (i, m) in msgs.iter().enumerate() {
+                    let c = m.content.as_str();
+                    match m.role.as_str() {
+                        "user" => s += &format!("<|im_start|>user\n{c}<|im_end|>\n"),
+                        "system" if i > 0 => s += &format!("<|im_start|>system\n{c}<|im_end|>\n"),
+                        "assistant" => {
+                            let (r, c) = if reasoning { split_think(m, c) } else { ("", c) };
+                            if reasoning && i > lq && (i + 1 == msgs.len() || !r.is_empty()) {
+                                s += &format!("<|im_start|>assistant\n<think>\n{}\n</think>\n\n{}", r.trim_matches('\n'), c.trim_start_matches('\n'));
+                            } else {
+                                s += &format!("<|im_start|>assistant\n{c}");
+                            }
+                            for (k, call) in m.calls.iter().enumerate() {
+                                if k > 0 || !c.is_empty() { s += "\n"; }
+                                s += &format!("<tool_call>\n{{\"name\": \"{}\", \"arguments\": {}}}\n</tool_call>", call.name, call.args.dump());
+                            }
+                            s += "<|im_end|>\n";
+                        }
+                        "tool" => {
+                            if i == 0 || msgs[i - 1].role != "tool" { s += "<|im_start|>user"; }
+                            s += &format!("\n<tool_response>\n{c}\n</tool_response>");
+                            tool_end(&mut s, i);
+                        }
+                        _ => {}
+                    }
+                }
+                if generate { s += "<|im_start|>assistant\n"; }
+            }
+        }
+        s
+    }
+
+    /// The prompt that ends inside the last message when it is an assistant message without tool calls, so the
+    /// model continues that reply (prefill, as llama.cpp's server and the Anthropic Messages API do). `None` when
+    /// the last message is not one.
+    pub fn render_open(&self, msgs: &[Msg], tools: &[Json], think: bool, preserve: bool) -> Option<String> {
+        msgs.last().filter(|m| m.role == "assistant" && m.calls.is_empty())?;
+        let s = self.render(msgs, tools, think, preserve, false);
+        let end = match self { Template::Ds => "<｜end▁of▁sentence｜>", Template::Flint => "", _ => "<|im_end|>\n" };
+        Some(s.strip_suffix(end).unwrap_or(&s).to_string())
+    }
+
+    /// The text that starts a tool call in a reply.
+    pub fn call_tag(&self) -> &'static str { if let Template::Ds = self { DS_CALLS } else { TAG } }
+
+    /// Tool calls at the end of a reply: the text before them, and the name and arguments (JSON text) of each call.
+    /// None when the reply has no call or a call is malformed; the reply then goes out as plain text.
+    // ponytail: a literal `<tool_call>` inside the thinking part makes the reply plain text; strip the think block
+    // first if thinking with tools matters.
+    pub fn parse_calls(&self, text: &str, tools: &[Json]) -> Option<(String, Vec<(String, String)>)> {
+        if let Template::Ds = self { return ds_calls(text); }
+        if let Template::Flint = self { return flint_calls(text); }
+        let start = text.find(TAG)?;
+        let mut rest = &text[start..];
+        let mut calls = Vec::new();
+        loop {
+            rest = rest.trim_start();
+            if rest.is_empty() { break; }
+            let inner;
+            (inner, rest) = rest.strip_prefix(TAG)?.split_once("</tool_call>")?;
+            calls.push(match self { Template::Ds | Template::Flint => unreachable!(), Template::Xml => xml_call(inner, tools)?, Template::Json { .. } => json_call(inner)? });
+        }
+        Some((text[..start].trim_end().to_string(), calls))
+    }
+}
+
+/// DeepSeek reply: a `<｜DSML｜ calls>` block of `invoke` items with `parameter name=".." string="true|false"`. A
+/// parameter is a string when the model says so, else JSON (a string if it does not parse). The reply's thinking part
+/// is skipped, so a tag inside it is not taken for a call.
+// ponytail: not run against the real model (the weights are deleted); the format is the template's own.
+fn ds_calls(text: &str) -> Option<(String, Vec<(String, String)>)> {
+    let from = text.rfind("</think>").map_or(0, |p| p + 8);
+    let start = from + text[from..].find(DS_CALLS)?;
+    let mut rest = text[start.
+
+---
+Reply with a one-paragraph technical summary of the code above, then list its three most important functions.

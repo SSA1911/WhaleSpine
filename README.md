@@ -37,7 +37,7 @@ Everything below: Qwen3.8-Flash-Next GSQ-RCO Q2_0 (66.4 GB, MoE — 48 layers, 5
 
 **Caveats that matter (details in docs/findings.md):**
 
-- `bench` decodes a raw greedy continuation of a repeated prefill prompt — a near-copy task that flatters speculative decoding (100% acceptance, 65% expert hit). In generate mode on one deep ~90k-token prompt, no-draft ran ~14.6 tok/s (vs 33.7 in bench mode), MTP ~18.6 (+27%), DFlash2 ~11.4 (−22%), acceptance 69.0% — while a shallow generate-mode run flipped that ranking (no-draft 17.4, DFlash2 18.7, MTP 13.0). Every arm is a single run; treat all of it as directional, and measure your own workload before enabling a drafter.
+- `bench` decodes a raw greedy continuation of a repeated prefill prompt — a near-copy task that flatters speculative decoding (100% acceptance, 65% expert hit). In generate mode on one deep ~90k-token prompt, no-draft ran ~14.6 tok/s (vs 33.7 in bench mode), MTP ~18.6 (+27%), DFlash2 ~11.4 (−22%), acceptance 69.0% — while a shallow generate-mode run flipped that ranking (no-draft 17.4, DFlash2 18.7, MTP 13.0). Every arm is a single run; treat all of it as directional. A controlled 21-cell serving comparison on real text (chat mode, fresh server per cell, findings §3.5) found no drafter configuration that beats plain no-draft decoding beyond noise on this machine — measure your own workload before enabling a drafter.
 - Speculative decoding here does not reproduce undrafted greedy output byte-for-byte; even no-draft output forks between CUDA and Vulkan (near-tie argmax flips). Outputs stay coherent.
 - Every number is greedy decoding; sampled decoding was not measured.
 

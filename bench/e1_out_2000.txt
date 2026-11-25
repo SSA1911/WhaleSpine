@@ -1,0 +1,11 @@
+_bytes(self.cols)) }
+}
+
+/// A kernel op: takes device addresses, returns device memory.
+pub trait Backend {
+    fn name(&self) -> String;
+    fn alloc(&self, len: usize) -> Buf;
+    fn upload(&self, src: &[u8], dst: u64);
+    fn upload_tensor(&self, t: &Tensor) -> GpuTensor;
+    fn upload_tensor_f32(&self, t: &Tensor) -> GpuTensor;
+    fn upload_f32(&self, src: &[f32], dst: u

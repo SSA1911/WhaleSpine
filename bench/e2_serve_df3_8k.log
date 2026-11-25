@@ -1,0 +1,18 @@
+listening on http://127.0.0.1:8203/ (models folder: C:\Users\Shehryar\AppData\Local\rusting_strata\models)
+loading Z:/ai-models/gguf/qwen3.8-flash-next-gsq-rco/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf
+note: loaded standalone DFlash2 draft model (layers=5, block=8, mask=248077, target_layers=[5, 15, 25, 35, 45], heads=32x128, kv=8, ff=7680)
+cuda device 0: NVIDIA GeForce RTX 4070 SUPER, sm_89
+cuda shared memory: opt-in 101376 B per block, attn_decode_gqa*: 2112 B static, dynamic max 73728 B, carveout default
+cuda shared memory: opt-in 101376 B per block, attn_prefill_*: 0 B static, dynamic max 72704 B, carveout default
+cuda shared memory: opt-in 101376 B per block, gemvn_*: 0 B static, dynamic max 101376 B, carveout default
+calibration: C:\Users\Shehryar\AppData\Local\rusting_strata\strata-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.json
+draft model socket: registered candidate Z:/ai-models/mtp-heads/dflash2-st/model-dflash-q8_0.gguf
+DFlash2 block-diffusion drafter loaded: 5 layers (SWA=5, full=0), block_size=8, k=3, w=Q8_0, target_layers=[5, 15, 25, 35, 45]
+expert profile: C:\Users\Shehryar\AppData\Local\rusting_strata\profile-qwen4exp-48x512-1224.f32
+plan: weights+state+scratch 8768 MB (KV 1536 MB for 65536 tokens, prefill 1589 MB), expert slots 1730 MB, resident experts 1312/24576
+expert traffic: 13.2 MB per layer active set (top-10), 632.8 MB per token over 48 MoE layers
+chat template: Xml
+loaded Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002
+request: POST /v1/chat/completions key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=8721 tok stream=false tools=0
+sampling: temp=0 top_k=0 top_p=1 presence=0 frequency=0 repeat=1/64 dry=0/1.75/2
+done: key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=8721 tok (0 cached) -> 512 tok in 18.60 s, decode 27.5 tok/s, prefill 79.1 tok/s, finish=length

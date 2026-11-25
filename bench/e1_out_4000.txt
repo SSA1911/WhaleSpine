@@ -1,0 +1,13 @@
+::load(device).map(Box::new).or_else(|_| crate::vulkan::Vk::new(device).map(Box::new)),
+    }
+}
+
+pub trait Backend {
+    fn name(&self) -> &str;
+    fn device(&self) -> usize;
+    fn total_mem(&self) -> u64;
+    fn free_mem(&self) -> u64;
+
+    fn alloc(&self, len: usize) -> Buf;
+    fn free(&self, buf: &Buf);
+    fn upload(&self, buf: &Buf, data: &[u8

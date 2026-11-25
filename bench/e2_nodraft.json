@@ -1,0 +1,26 @@
+{
+ "2k": {
+  "elapsed_s": 56.5,
+  "prompt_tokens": 1902,
+  "completion_tokens": 512,
+  "finish": "length",
+  "content_chars": 1096,
+  "reasoning_chars": 1139
+ },
+ "8k": {
+  "elapsed_s": 95.0,
+  "prompt_tokens": 5138,
+  "completion_tokens": 512,
+  "finish": "length",
+  "content_chars": 692,
+  "reasoning_chars": 1589
+ },
+ "24k": {
+  "elapsed_s": 16.4,
+  "prompt_tokens": 5138,
+  "completion_tokens": 512,
+  "finish": "length",
+  "content_chars": 0,
+  "reasoning_chars": 2312
+ }
+}

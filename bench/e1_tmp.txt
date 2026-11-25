@@ -1,0 +1,47 @@
+// ==== /z/ai-models/rs-v131wt/src/backend.rs
+//! Backend seam: device memory as `Buf` (an address plus whatever keeps the memory alive) and the kernel ops the
+//! model runs. Every op takes device addresses, so model code never sees backend types. `cuda` and `vulkan` implement it.
+
+use crate::quant::GgmlType;
+use crate::weights::Tensor;
+use std::any::Any;
+
+/// Blocks per head in decode attention (positions split across them). Scratch sizes depend on it.
+pub const ATT_SPLITS: usize = 32;
+/// Splits of the one-head-per-block decode attention used below ATT_GQA_MIN positions.
+pub const ATT_SPLITS_1: usize = 16;
+/// Positions from which decode attention shares K/V loads across a GQA group (break-even measured near 2K).
+pub const ATT_GQA_MIN: i32 = 2048;
+const _: () = assert!(ATT_SPLITS <= 256); // attn_merge keeps one weight per split in a 256-thread block
+/// Positions per GEMM tile. Prefill cuts its tile lists at this size.
+pub const GEMM_BM: usize = 128;
+
+/// `len` bytes of device memory at device address `addr`, freed when the last clone drops.
+#[derive(Clone)]
+pub struct Buf {
+    addr: u64,
+    len: usize,
+    _owner: std::sync::Arc<dyn Any + Send + Sync>,
+}
+
+impl Buf {
+    pub fn new(addr: u64, len: usize, owner: impl Any + Send + Sync) -> Buf { Buf { addr, len, _owner: std::sync::Arc::new(owner) } }
+    pub fn addr(&self) -> u64 { self.addr }
+    pub fn len(&self) -> usize { self.len }
+}
+
+#[derive(Clone)]
+pub struct GpuTensor {
+    pub ty: GgmlType,
+    pub rows: usize,
+    pub cols: usize,
+    pub ptr: u64,
+    pub scale: f32,
+    _buf: Buf,
+}
+
+impl GpuTensor {
+    /// `rows` x `cols` of `ty` stored in `buf` from its start.
+    pub fn new(ty: GgmlType, rows: usize, cols: usize, buf: Buf) -> GpuTensor { GpuTensor { ty, rows, cols, ptr: buf.addr, scale: 1.0, _buf: buf } }
+    pub fn with_scale(mut self, scale: f32) -> GpuTensor { self.scale = scale; self }
+    pub fn bytes(&self) -> usize { self.ty.row_bytes(self.col
