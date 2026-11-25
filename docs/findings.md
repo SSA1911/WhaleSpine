@@ -24,7 +24,7 @@ Some terms used throughout:
 | GPU | NVIDIA RTX 4070 SUPER 12 GB, driver 617.14 |
 | CPU / RAM | AMD Ryzen 9 7900X3D, 32 GB DDR5 |
 | Model storage | local fixed drive (Z:) |
-| Engine | RustingStrata v1.3.1 (upstream `main` @ `4b3f44b`); CUDA kernels compiled at run time by NVRTC — no CUDA build step |
+| Engine | RustingStrata v1.3.1 (upstream `main` @ `4b3f44b` at measurement time; upstream has since released v1.3.2 @ `932b252`, which also fixes a Windows working-set accounting issue relevant to expert streaming); CUDA kernels compiled at run time by NVRTC — no CUDA build step |
 | Compiler | rustc 1.100.0 (0ef1bc386, 2026-11-09), LLVM 23.1.5; MSVC build via `--target x86_64-pc-windows-msvc`, `RUSTFLAGS="-C target-cpu=x86-64-v3"` |
 | Model | Qwen3.8-Flash-Next GSQ-RCO Q2_0 — 66.4 GB across two shards (61.9 GiB), qwen4exp A3B MoE, 48 layers, 512 experts, 10 active per token |
 | Head | incoai/Qwen3.8-Flash-Next-DFlash2, safetensors `d6723f2a…`, converted with the in-repo converter, GGUF SHA-256 `c00080c5…` |
@@ -59,9 +59,9 @@ The first local build measured ~21 t/s against the release binary's 34.4 t/s —
 
 ## 2. The fix, and what it is worth
 
-**The bug.** The drafter's input features are the target model's hidden states, captured at the head's `target_layers`. On hyper-connection targets the capture source holds the hc streams interleaved per position, but both capture sites copied with a single-stream stride, so capture row *r* read stream `r mod hc_n` of position `r / hc_n`. A drafter trained on the streams' mean (that is what the reference converter trains on) never saw features it was trained on. Same defect in both the decode-step path (`src/gpu_model.rs`) and the prefill path (`src/gpu_model/prefill.rs`).
+**The bug.** The drafter's input features are the target model's hidden states, captured at the head's `target_layers`. On hyper-connection targets the capture source holds the hc streams interleaved per position, but both capture sites copied with a single-stream stride, so capture row *r* read stream `r mod hc_n` of position `r / hc_n`. A drafter is trained to consume the streams' mean (llama.cpp fixed the identical bug the same way for this architecture, ggml-org/llama.cpp#30927) and never saw inputs it was trained on. Same defect in both the decode-step path (`src/gpu_model.rs`) and the prefill path (`src/gpu_model/prefill.rs`).
 
-**The fix.** Collapse the hc streams to their plain mean first (RustingStrata's existing `hc_mix` with a saturated gate — sigmoid(12) ≈ 1 − 6·10⁻⁶, and the residual scale is absorbed by the following bias-free `fc` + `hidden_norm`), then copy. The prefill copy is tiled to `TMAX` blocks because `hc_mix`'s gate buffer indexes per position. Targets without hyper-connections take the unchanged path, and the mean scratch buffer is only allocated when needed. Two files, +18/−1 and +22/−2, no API or format changes.
+**The fix.** Collapse the hc streams to their plain mean first (RustingStrata's existing `hc_mix` with a saturated gate — sigmoid(12) ≈ 1 − 6·10⁻⁶, and the residual scale is absorbed by the following bias-free `fc` + `hidden_norm`), then copy. The prefill copy is tiled to `TMAX` blocks because `hc_mix`'s gate buffer indexes per position. Targets without hyper-connections take the unchanged path, and the mean scratch buffer is only allocated when needed. Two files, +18/−1 and +22/−2, no API or format changes. The patch's own prefill cost at 8k (reps 1): 125.8 → 109.9 tok/s (≈ −13%). The EAGLE3 capture paths (`gpu_model.rs:1975`, `prefill.rs:376`) carry the same single-stream copy with no hc guard — untouched here; flagged upstream as a follow-up.
 
 **Before / after, measured honestly.** With a working head and a calibrated profile, unpatched v1.3.1 accepts **44.0%** of drafts on an 8k-context bench run (`DFlash drafts accepted 74/168`). With the patch: **100%** (`96/96`; 5-rep 131k run: `480/480`). (An earlier draft of this document claimed "0% before": those runs used a head we remapped by hand from a llama.cpp-format GGUF, with two conversion bugs in our script. Passing the Hugging Face directory to the engine and letting it convert natively was always correct.)
 
@@ -74,7 +74,7 @@ The first local build measured ~21 t/s against the release binary's 34.4 t/s —
 
 **+55% decode with this head at 131k context**, paid for with 24% slower prefill.
 
-Two honesty notes. First, the same configurations measured in *different sessions* spread 50.0–56.3 t/s (≈12% drift) on the DFlash2 arm; cross-session A/Bs are why our first headline (+88%) and a later one (+67%) were both wrong in different directions — the interleaved pair is the number we stand behind. Second, `--kv q4` (a smaller KV cache) added ~+8.5% for speculative runs (61.0 t/s, 3 reps), but a no-draft q4 control at 131k thrashed (no completed rep in 108 minutes; a 32k probe ran fine at 29.9 t/s), so quote q4 as a speculative-only configuration, and note its mechanism is unresolved — the plan print shows q4 actually *raises* resident experts (3,552 vs 2,960). `--spec-draft-n-max` does not reach the DFlash2 path at all (it populates only the ngram config; `main.rs:501–517`) — deltas attributed to it were noise.
+Two honesty notes. First, the same configurations measured in *different sessions* spread 50.0–56.3 t/s (≈12% drift) on the DFlash2 arm; cross-session A/Bs are why our first headline (+88%) and a later one (+67%) were both wrong in different directions — the interleaved pair is the number we stand behind. Second, `--kv q4` (a smaller KV cache) added ~+8.5% for speculative runs (61.0 t/s, 3 reps), but a no-draft q4 control at 131k thrashed (no completed rep in 108 minutes; a 32k probe ran fine at 29.9 t/s), so quote q4 as a speculative-only configuration, and note its mechanism is unresolved — the no-draft q4 control's plan print shows q4 *raises* resident experts (3,552 vs 2,960), while the spec q4 arm itself ran 2,160 resident (vs 1,104 at q8 spec) — the two arms run different memory plans, which is part of why the mechanism is hard to pin. `--spec-draft-n-max` does not reach the DFlash2 path at all (it populates only the ngram config; `main.rs:501–517`) — deltas attributed to it were noise.
 
 ## 3. The bench-vs-generate caveat (the practically important part)
 
@@ -86,13 +86,16 @@ One deep generate-mode run (~90k-token prompt, 1,700 repeats of a 239-byte instr
 |---|--:|--:|--:|
 | no draft | 14.6 t/s | 30.3% | 2,960 |
 | DFlash2 | 11.4 t/s (−22%) | 16.7% | 1,104 |
-| MTP(4) | 18.6 t/s (+27%) | 26.9% | 2,254 |
+| MTP | 18.6 t/s (+27%) | 26.9% | 2,254 |
+
+(The MTP arm requested 4 draft tokens; the engine verifies at most 3 draft tokens per step on every backend — `verify_rows()` is a constant 4, `src/backend.rs:488`, `k = k.min(verify_rows() - 1)`, `src/gpu_model.rs:715`. The same cap applies to DFlash2's default block of 7, so `--mtp N` is the actual draft-length knob for both.)
 
 Readings from this run, all single-run/n=1:
 
 - Bench decode overstates serving decode even *without* speculative decoding: bench-mode no-draft ran 33.7 t/s vs generate-mode 14.6 on comparable content. Whatever the bench table says about throughput, treat it as a bench-regime number.
 - The DFlash2 arm lost in generate mode while winning in bench mode on the same file (bench arm: 52.6 t/s, 100% acceptance, 37.6% hit). What differs between the modes in our logs is acceptance (100% vs 69.0%) and hit rate (40.5% vs 16.7%), not residency — the bench DFlash2 arm also ran 1,104 resident experts and won. We cannot yet explain the regime boundary; the arms also ran different memory plans (2,960/2,254/1,104 resident), so CPU/GPU expert placement is a confound.
-- On this measurement, MTP(4) is the only positive generate-mode lever (+27%), tracking worker-busy amortization (33.6 vs 51.9 ms) rather than hit rate.
+- On this measurement, MTP is the only positive generate-mode lever (+27%), tracking worker-busy amortization (33.6 vs 51.9 ms) rather than hit rate.
+- This ranking is not stable across depth. Our identity-check runs — invalid as identity checks (a file path was passed as the prompt) but still valid shallow-depth throughput samples — flipped it: no-draft 17.43, DFlash2 18.70 (+7%), MTP 12.97 (−26%) on CUDA. Every arm here is n=1; treat both directions as unsettled until the deep diverse-text comparison is unblocked (section 5).
 
 Do not generalize the generate-mode ranking from one prompt on repetitive content; replication on genuinely diverse text is blocked by the EOS issue below.
 
