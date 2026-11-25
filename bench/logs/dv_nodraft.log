@@ -1,0 +1,14 @@
+cuda device 0: NVIDIA GeForce RTX 4070 SUPER, sm_89
+cuda shared memory: opt-in 101376 B per block, attn_decode_gqa*: 2112 B static, dynamic max 73728 B, carveout default
+cuda shared memory: opt-in 101376 B per block, attn_prefill_*: 0 B static, dynamic max 72704 B, carveout default
+cuda shared memory: opt-in 101376 B per block, gemvn_*: 0 B static, dynamic max 101376 B, carveout default
+calibration: C:\Users\<user>\AppData\Local\rusting_strata\strata-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.json
+expert profile: C:\Users\<user>\AppData\Local\rusting_strata\profile-qwen4exp-48x512-1224.f32
+plan: weights+state+scratch 6592 MB (KV 1632 MB for 131072 tokens, prefill 1389 MB), expert slots 3902 MB, resident experts 2960/24576
+expert traffic: 13.2 MB per layer active set (top-10), 632.8 MB per token over 48 MoE layers
+
+prompt 91290 tok 89.05 tok/s | gen 0 tok 0.00 tok/s
+CPU expert compute, share of gen time: 0.0%
+expert hit rate 0.0% (0 misses), cache swaps 1971
+worker busy 0.0 µs/token, worker stalls 0
+mailbox traffic: 0 GPU writes, 0 host routing reads (fast path off, 2960/24576 experts resident)

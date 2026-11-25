@@ -1,0 +1,17 @@
+note: loaded standalone DFlash2 draft model (layers=5, block=8, mask=248077, target_layers=[5, 15, 25, 35, 45], heads=32x128, kv=8, ff=7680)
+vulkan device 0: NVIDIA GeForce RTX 4070 SUPER
+vulkan: NVIDIA GeForce RTX 4070 SUPER (NVIDIA 617.14), cooperative matrix f16 yes int8 yes (16x16x32), conditional rendering yes, maxComputeSharedMemorySize 49152
+calibration: C:\Users\<user>\AppData\Local\rusting_strata\strata-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002-vulkan.json
+draft model socket: registered candidate Z:/ai-models/mtp-heads/dflash2-st/model-dflash-q8_0.gguf
+vulkan: shared-memory preflight: 132 (kernel, specialization) pairs checked, largest 49152 bytes (gemmi) of 49152 allowed, 1.3 ms
+DFlash2 block-diffusion drafter loaded: 5 layers (SWA=5, full=0), block_size=8, k=7, w=Q8_0, target_layers=[5, 15, 25, 35, 45]
+expert profile: C:\Users\<user>\AppData\Local\rusting_strata\profile-qwen4exp-48x512-1224.f32
+plan: weights+state+scratch 9015 MB (KV 1632 MB for 131072 tokens, prefill 1589 MB), expert slots 1666 MB, resident experts 1264/24576
+expert traffic: 13.2 MB per layer active set (top-10), 632.8 MB per token over 48 MoE layers
+
+prompt 27 tok 19.29 tok/s | gen 128 tok 11.78 tok/s
+CPU expert compute, share of gen time: 68.4%
+DFlash drafts accepted 76/399 (19.0%)
+expert hit rate 50.0% (109495 misses), cache swaps 1656
+worker busy 16301.6 µs/token, worker stalls 58
+mailbox traffic: 1149 GPU writes, 2736 host routing reads (fast path off, 1264/24576 experts resident)

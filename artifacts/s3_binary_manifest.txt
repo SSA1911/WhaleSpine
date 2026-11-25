@@ -1,3 +1,5 @@
-b6406f153bc90da104c6361efd4cdd26753a1d51b2ea656230542a1ceb3a8454 *target/x86_64-pc-windows-msvc/release/rustingstrata.exe
-72eaf67e882ca611086404e7913a35f8b6779474f33bd56061b195c745483ec9 */z/ai-models/rs-v131/rustingstrata-v131.exe
-11f547b4f225b35b7079806c16f451a58a82041ba6d34031d2815f9eb5e1bedd *target/x86_64-pc-windows-msvc/release/rustingstrata.exe
+72eaf67e882ca611086404e7913a35f8b6779474f33bd56061b195c745483ec9  rustingstrata-v131.exe (upstream v1.3.1 release binary)  (rustingstrata-v131.exe)
+efaefe508aca0c293d2ce28fc9e864981eeda4c68bf7a8983ac114c95cdd9af4  final MSVC build (branch hc-dflash2-gather @ 17b7cae, incl. hc-gather fix + review micro-fixes)
+
+rustc 1.100.0 (0ef1bc386 2026-11-09), commit 0ef1bc386059596dada8fb65b50425aab2ea637a, LLVM 23.1.5, host x86_64-pc-windows-gnu (MSVC exe built with --target x86_64-pc-windows-msvc)
+All local builds: RUSTFLAGS="-C target-cpu=x86-64-v3", cargo build --release --target x86_64-pc-windows-msvc

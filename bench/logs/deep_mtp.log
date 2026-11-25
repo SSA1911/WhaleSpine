@@ -1,0 +1,16 @@
+note: loaded standalone MTP draft head from companion GGUF (layer 48)
+cuda device 0: NVIDIA GeForce RTX 4070 SUPER, sm_89
+cuda shared memory: opt-in 101376 B per block, attn_decode_gqa*: 2112 B static, dynamic max 73728 B, carveout default
+cuda shared memory: opt-in 101376 B per block, attn_prefill_*: 0 B static, dynamic max 72704 B, carveout default
+cuda shared memory: opt-in 101376 B per block, gemvn_*: 0 B static, dynamic max 101376 B, carveout default
+calibration: C:\Users\<user>\AppData\Local\rusting_strata\strata-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.json
+expert profile: C:\Users\<user>\AppData\Local\rusting_strata\profile-qwen4exp-48x512-1224.f32
+plan: weights+state+scratch 7360 MB (KV 1632 MB for 131072 tokens, prefill 1565 MB), expert slots 3140 MB, resident experts 2254/25088
+expert traffic: 49.8 MB per layer active set (top-10), 682.6 MB per token over 49 MoE layers
+
+prompt 90101 tok 569.97 tok/s | gen 128 tok 18.63 tok/s
+CPU expert compute, share of gen time: 71.8%
+MTP drafts accepted 82/99 (82.8%)
+expert hit rate 26.9% (52880 misses), cache swaps 1811
+worker busy 33568.1 µs/token, worker stalls 0
+mailbox traffic: 154 GPU writes, 2406 host routing reads (fast path off, 2254/25088 experts resident)

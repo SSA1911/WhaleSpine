@@ -25,4 +25,4 @@ One patch on top of upstream v1.3.1 (+2 serve commits): the hc-gather path in `s
 
 ## Commit style
 
-Conventional Commits (`fix:`, `bench:`, `docs:`, `serve:` - the last matches upstream's convention). Keep commits single-purpose.
+Upstream commit style is `area: plain sentence` (e.g. `serve: ...`, `hip: ...`, `backend: ...`) - follow it; do not use Conventional Commits types like `feat:`/`docs:`. Keep commits single-purpose.
