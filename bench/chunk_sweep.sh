@@ -22,9 +22,12 @@ for chunk in 2048 8192 16384; do
   if [ "$ok" != 1 ]; then echo "SERVER-FAILED chunk=$chunk"; kill_server=1; fi
   if [ "$ok" = 1 ]; then
     sleep 3
-    python - "$chunk" "$BASE" <<'PY'
-import sys, json, time, urllib.request
-chunk, msg = sys.argv[1], json.loads(sys.argv[2])
+    python - "$chunk" <<'PY'
+import sys, json, time, urllib.request, pathlib
+chunk = sys.argv[1]
+base = pathlib.Path('bench/replay_base_ctx.txt').read_text(encoding='utf-8')
+msg = ("You are assisting an engineer in the repository shown above. Reply to the LATEST user message only.\n\n"
+       + base + "\n\n(Turn 1) List every file shown above and, in one line each, what it is responsible for.")
 req = urllib.request.Request("http://127.0.0.1:8206/v1/chat/completions",
     data=json.dumps({"messages": [{"role": "user", "content": msg}], "max_tokens": 128}).encode(),
     headers={"Content-Type": "application/json"})

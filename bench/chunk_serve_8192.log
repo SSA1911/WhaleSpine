@@ -10,3 +10,6 @@ plan: weights+state+scratch 9376 MB (KV 3072 MB for 131072 tokens, prefill 2714 
 expert traffic: 13.2 MB per layer active set (top-10), 632.8 MB per token over 48 MoE layers
 chat template: Xml
 loaded Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002
+request: POST /v1/chat/completions key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=100488 tok stream=false tools=0
+sampling: temp=0 top_k=0 top_p=1 presence=0 frequency=0 repeat=1/64 dry=0/1.75/2
+done: key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=100488 tok (0 cached) -> 128 tok in 7.86 s, decode 16.3 tok/s, prefill 146.6 tok/s, finish=length

@@ -6,3 +6,10 @@ cuda shared memory: opt-in 101376 B per block, attn_prefill_*: 0 B static, dynam
 cuda shared memory: opt-in 101376 B per block, gemvn_*: 0 B static, dynamic max 101376 B, carveout default
 calibration: C:\Users\Shehryar\AppData\Local\rusting_strata\strata-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.json
 expert profile: C:\Users\Shehryar\AppData\Local\rusting_strata\profile-qwen4exp-48x512-1224.f32
+plan: weights+state+scratch 7360 MB (KV 3072 MB for 131072 tokens, prefill 726 MB), expert slots 3143 MB, resident experts 2384/24576
+expert traffic: 13.2 MB per layer active set (top-10), 632.8 MB per token over 48 MoE layers
+chat template: Xml
+loaded Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002
+request: POST /v1/chat/completions key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=100488 tok stream=false tools=0
+sampling: temp=0 top_k=0 top_p=1 presence=0 frequency=0 repeat=1/64 dry=0/1.75/2
+done: key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=100488 tok (0 cached) -> 128 tok in 6.56 s, decode 19.5 tok/s, prefill 60.0 tok/s, finish=length
