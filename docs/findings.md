@@ -135,6 +135,19 @@ Decision rules were fixed before the run (from an independent consult):
 
 **Chunk follow-up (same cold prefill, one rep per cell, `bench/chunk_sweep.jsonl`):** prefill scales with `--chunk` because experts re-stream at chunk boundaries. `--chunk 2048` = 1,683.8 s (+46% vs the 4096 baseline above); `--chunk 8192` = **693.6 s (−40%)**; `--chunk 16384` is refused by the VRAM-margin guard at 131k ctx on 12 GB (prefill scratch leaves 0 MB free, under the 512 MB margin). **Recommended serving value at depth: `--chunk 8192`** — it nearly halves the one-time cold prefill and shrinks the prefill segment of every warm turn, with no engine or quality change.
 
+## 3.7 Corrected DFlash2 on warm deep turns (the last open case, closed)
+
+The one remaining argument for the drafter was time-to-usable-answer at depth (a consult flagged that §3.6 measured capped-request latency with a 512-token budget, which truncated reasoning). Re-run on the same ~100.5k-token base and real turn injections, both arms `--kv q8`, reply budget 2,048 tokens so answers complete, two interleaved passes per arm (nd→df→df→nd), persistent server per phase, byte-identical prompts (`bench/dflash_warm_cells.jsonl`, 12/12 rows). At 131k context DFlash2 does not even start on f16 KV (0 MB free — the §2 drafter-KV finding, deployment-relevant); under q8 both arms run.
+
+| turn (warm) | no-draft wall | DFlash2 wall | Δ | decode t/s (nd vs df) | prefill t/s (nd vs df) |
+|---|--:|--:|--:|--|--|
+| turn2 | 86.9 / 79.2 s | 103.7 / 98.5 s | **+21.7%** | 27.6 vs 30.5 | 43 vs 40 |
+| turn6 | 86.4 / 87.6 s | 101.4 / 100.2 s | **+15.9%** | 26.9 vs 29.1 | 92.6 vs 71.8 |
+
+The drafter genuinely accelerates decode (+10–15%), and answers were complete on both arms (finish=stop, ≥1,842 content chars). It still loses end-to-end because it (a) pays its own prefill cost on every turn's new tokens and (b) writes ~20–45% more tokens for the same task, so the decode win never covers the rest. The pre-registered reopen threshold — DFlash2 ≥ +10% on both turns in both passes — is not merely unmet, it is reversed: **the corrected DFlash2 is 16–22% slower on real warm deep turns.** With §3.5 (all depths), §3.6 (MTP) and this, every drafter configuration is now beaten by stock no-draft on this workload. The fork performance line is closed.
+
+
+
 ## 4. Output identity
 
 Speculative decoding here does not reproduce undrafted greedy output byte-for-byte. Elimination evidence, all on the same ~90k-token prompt, temp 0: no-draft output is stable *within* a backend but forks *between* backends (CUDA vs Vulkan, first differing byte 24, 0-indexed) — the cleanest evidence that floating-point accumulation order alone flips near-tie argmax choices. DFlash2 diverges on both CUDA and Vulkan; the native MTP path, which this fix does not touch, also diverges on CUDA (fork at byte 67) — no Vulkan MTP run was made. The arms run different memory plans, so CPU/GPU expert placement is a further confound; we did not measure logit margins and claim consistency with near-tie flips, not a proven mechanism. Every divergent output we inspected was a coherent, on-task continuation.
