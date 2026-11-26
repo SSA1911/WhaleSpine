@@ -1,0 +1,11 @@
+### TOOL RESULT: artifacts/s3_binary_manifest.txt
+```
+72eaf67e882ca611086404e7913a35f8b6779474f33bd56061b195c745483ec9  rustingstrata-v131.exe (upstream v1.3.1 release binary)  (rustingstrata-v131.exe)
+efaefe508aca0c293d2ce28fc9e864981eeda4c68bf7a8983ac114c95cdd9af4  final MSVC build (branch hc-dflash2-gather @ 17b7cae, incl. hc-gather fix + review micro-fixes)
+
+rustc 1.100.0 (0ef1bc386 2026-11-09), commit 0ef1bc386059596dada8fb65b50425aab2ea637a, LLVM 23.1.5, host x86_64-pc-windows-gnu (MSVC exe built with --target x86_64-pc-windows-msvc)
+All local builds: RUSTFLAGS="-C target-cpu=x86-64-v3", cargo build --release --target x86_64-pc-windows-msvc
+
+```
+
+(Turn 4) Using the shared repository context above, analyze this tool result and summarize the three most important facts for someone debugging engine performance.

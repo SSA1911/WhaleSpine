@@ -1,0 +1,24 @@
+### TOOL RESULT: bench/logs/deep_dflash.log (engine run log excerpt)
+```
+note: loaded standalone DFlash2 draft model (layers=5, block=8, mask=248077, target_layers=[5, 15, 25, 35, 45], heads=32x128, kv=8, ff=7680)
+cuda device 0: NVIDIA GeForce RTX 4070 SUPER, sm_89
+cuda shared memory: opt-in 101376 B per block, attn_decode_gqa*: 2112 B static, dynamic max 73728 B, carveout default
+cuda shared memory: opt-in 101376 B per block, attn_prefill_*: 0 B static, dynamic max 72704 B, carveout default
+cuda shared memory: opt-in 101376 B per block, gemvn_*: 0 B static, dynamic max 101376 B, carveout default
+calibration: C:\Users\<user>\AppData\Local\rusting_strata\strata-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.json
+draft model socket: registered candidate Z:/ai-models/mtp-heads/dflash2-st/model-dflash-q8_0.gguf
+DFlash2 block-diffusion drafter loaded: 5 layers (SWA=5, full=0), block_size=8, k=3, w=Q8_0, target_layers=[5, 15, 25, 35, 45]
+expert profile: C:\Users\<user>\AppData\Local\rusting_strata\profile-qwen4exp-48x512-1224.f32
+plan: weights+state+scratch 9056 MB (KV 1632 MB for 131072 tokens, prefill 1589 MB), expert slots 1455 MB, resident experts 1104/24576
+expert traffic: 13.2 MB per layer active set (top-10), 632.8 MB per token over 48 MoE layers
+
+prompt 90101 tok 423.36 tok/s | gen 128 tok 11.42 tok/s
+CPU expert compute, share of gen time: 85.6%
+DFlash drafts accepted 87/126 (69.0%)
+expert hit rate 16.7% (67147 misses), cache swaps 1093
+worker busy 57134.0 µs/token, worker stalls 0
+mailbox traffic: 96 GPU writes, 2016 host routing reads (fast path off, 1104/24576 experts resident)
+
+```
+
+(Turn 5) Using the shared repository context above, analyze this tool result and summarize the three most important facts for someone debugging engine performance.

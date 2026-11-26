@@ -1,0 +1,36 @@
+listening on http://127.0.0.1:8205/ (models folder: C:\Users\Shehryar\AppData\Local\rusting_strata\models)
+loading Z:/ai-models/gguf/qwen3.8-flash-next-gsq-rco/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf
+cuda device 0: NVIDIA GeForce RTX 4070 SUPER, sm_89
+cuda shared memory: opt-in 101376 B per block, attn_decode_gqa*: 2112 B static, dynamic max 73728 B, carveout default
+cuda shared memory: opt-in 101376 B per block, attn_prefill_*: 0 B static, dynamic max 72704 B, carveout default
+cuda shared memory: opt-in 101376 B per block, gemvn_*: 0 B static, dynamic max 101376 B, carveout default
+calibration: C:\Users\Shehryar\AppData\Local\rusting_strata\strata-Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.json
+expert profile: C:\Users\Shehryar\AppData\Local\rusting_strata\profile-qwen4exp-48x512-1224.f32
+plan: weights+state+scratch 8032 MB (KV 3072 MB for 131072 tokens, prefill 1389 MB), expert slots 2468 MB, resident experts 1872/24576
+expert traffic: 13.2 MB per layer active set (top-10), 632.8 MB per token over 48 MoE layers
+chat template: Xml
+loaded Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002
+request: POST /v1/chat/completions key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=100488 tok stream=false tools=0
+sampling: temp=0 top_k=0 top_p=1 presence=0 frequency=0 repeat=1/64 dry=0/1.75/2
+done: key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=100488 tok (0 cached) -> 512 tok in 22.43 s, decode 22.8 tok/s, prefill 85.9 tok/s, finish=length
+request: POST /v1/chat/completions key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=102079 tok stream=false tools=0
+sampling: temp=0 top_k=0 top_p=1 presence=0 frequency=0 repeat=1/64 dry=0/1.75/2
+done: key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=102079 tok (100483 cached) -> 512 tok in 22.57 s, decode 22.7 tok/s, prefill 51.2 tok/s, finish=length
+request: POST /v1/chat/completions key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=102505 tok stream=false tools=0
+sampling: temp=0 top_k=0 top_p=1 presence=0 frequency=0 repeat=1/64 dry=0/1.75/2
+done: key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=102505 tok (102074 cached) -> 512 tok in 20.66 s, decode 24.8 tok/s, prefill 22.9 tok/s, finish=length
+request: POST /v1/chat/completions key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=102900 tok stream=false tools=0
+sampling: temp=0 top_k=0 top_p=1 presence=0 frequency=0 repeat=1/64 dry=0/1.75/2
+done: key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=102900 tok (102500 cached) -> 512 tok in 22.94 s, decode 22.3 tok/s, prefill 22.6 tok/s, finish=length
+request: POST /v1/chat/completions key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=103623 tok stream=false tools=0
+sampling: temp=0 top_k=0 top_p=1 presence=0 frequency=0 repeat=1/64 dry=0/1.75/2
+done: key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=103623 tok (102895 cached) -> 512 tok in 21.95 s, decode 23.3 tok/s, prefill 25.5 tok/s, finish=length
+request: POST /v1/chat/completions key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=107980 tok stream=false tools=0
+sampling: temp=0 top_k=0 top_p=1 presence=0 frequency=0 repeat=1/64 dry=0/1.75/2
+done: key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=107980 tok (103618 cached) -> 512 tok in 22.90 s, decode 22.4 tok/s, prefill 80.5 tok/s, finish=length
+request: POST /v1/chat/completions key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=108467 tok stream=false tools=0
+sampling: temp=0 top_k=0 top_p=1 presence=0 frequency=0 repeat=1/64 dry=0/1.75/2
+done: key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=108467 tok (107975 cached) -> 512 tok in 23.04 s, decode 22.2 tok/s, prefill 18.4 tok/s, finish=length
+request: POST /v1/chat/completions key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=110808 tok stream=false tools=0
+sampling: temp=0 top_k=0 top_p=1 presence=0 frequency=0 repeat=1/64 dry=0/1.75/2
+done: key=open model=Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002 prompt=110808 tok (108462 cached) -> 512 tok in 24.70 s, decode 20.7 tok/s, prefill 54.0 tok/s, finish=length

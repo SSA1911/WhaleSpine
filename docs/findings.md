@@ -117,6 +117,22 @@ Single rep per cell; the full grid is in `bench/e2_cells.jsonl` (21 cells, every
 - DFlash2 does not beat MTP at any depth. Per the decision rule fixed before the run — tuned DFlash2 must beat tuned MTP end-to-end on at least 2 of 3 prompts by more than run spread — the DFlash2 serving investigation **stops here**. A planned deeper-context (32k vs 131k) run was skipped as moot: at 24k the drafter's wasted full-context cache is already small and DFlash2 still loses, so the engine change (sizing the drafter cache to its 2,048-token window) cannot flip this verdict, though the ~1.4 GB waste at 131k remains a real memory issue worth reporting upstream on its own merits.
 - MTP at 3 drafts is the only arm that trends positive (−8%/−7%), and only at shallow depth; at 24k it is +3%. Treat as "no measurable serving win" rather than a recommendation.
 
+## 3.6 Agent-session replay at 100k+ context (the owner-regime test)
+
+The decisive serving test at the regime the fork exists for: a persistent server, a ~100.5k-token context of 14 real RustingStrata source files, and an 8-turn agent session (each turn injects a realistic tool result, log excerpt, or web dump; prompts byte-identical across arms via fixed assistant replies; 512-token greedy replies; one fresh server per phase, phases interleaved nd→mtp→mtp→nd). Stock upstream v1.3.4. Full grid in `bench/replay_cells.jsonl` (32 rows, 0 errors).
+
+| turn | no-draft (2 passes) | MTP 1 draft (2 passes) |
+|---|--:|--:|
+| turn 1 (cold, 100,488-tok base) | 1,153.7 / 1,192.6 s | 1,206.4 / 1,255.5 s |
+| turns 2–8 (warm; prompt grows to 110,808 tok) | **50.8 / 54.4 s mean** | 56.4 / 54.1 s mean |
+| whole session (turns 1–8) | 1,509 / 1,573 s | 1,601 / 1,634 s |
+
+Decision rules were fixed before the run (from an independent consult):
+
+- *Cache misses dominate turns 2+* — **refuted**. The prefix cache held through every session: after the one-time ~19-minute cold prefill of the base (measured ≈93 tok/s effective on real text with expert streaming), each agent turn cost 36–79 s end-to-end while the prompt grew to 110.8k tokens.
+- *MTP ≥ +8% better on both warm reps → enable MTP* — **refuted**. MTP(1) is +5.4% slower on warm turns on average and wins only 4 of 14; slower again on both cold turns. On this 12 GB card the drafter's VRAM cost (fewer resident experts at depth) exceeds its drafting gain in the chat path, matching section 3's bench-vs-generate and section 3.5's 2k–24k results.
+- Practical serving config at 100k+ on this hardware: **stock mainline, no-draft, prefix cache intact**. The one-time session setup is prefill-bound and dominated by expert streaming — hardware RAM (page cache) is the lever there, not engine flags or drafters.
+
 ## 4. Output identity
 
 Speculative decoding here does not reproduce undrafted greedy output byte-for-byte. Elimination evidence, all on the same ~90k-token prompt, temp 0: no-draft output is stable *within* a backend but forks *between* backends (CUDA vs Vulkan, first differing byte 24, 0-indexed) — the cleanest evidence that floating-point accumulation order alone flips near-tie argmax choices. DFlash2 diverges on both CUDA and Vulkan; the native MTP path, which this fix does not touch, also diverges on CUDA (fork at byte 67) — no Vulkan MTP run was made. The arms run different memory plans, so CPU/GPU expert placement is a further confound; we did not measure logit margins and claim consistency with near-tie flips, not a proven mechanism. Every divergent output we inspected was a coherent, on-task continuation.

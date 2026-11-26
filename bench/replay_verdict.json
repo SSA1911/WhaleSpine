@@ -1,0 +1,10 @@
+{
+ "design": "agent-session replay, persistent server per phase, ~100.5k-token real project context, 8 turns (tool results/web dumps), 512-token greedy replies, stock upstream v1.3.4",
+ "decision_rules": {
+  "a_cache_misses_dominate": "REFUTED \u2014 turns 2-8 all fast (36-79 s) with prompt growing to 110.8k; prefix cache holds through the session",
+  "b_prefill_dominates": "turn1 only (cold prefill ~95% of turn time, ~93 tok/s effective); warm turns are decode+overhead mixed",
+  "c_decode_bound_disk": "not fired \u2014 no thrash signature in warm turns",
+  "d_mtp_wins": "REFUTED \u2014 MTP(1) is +5.4% SLOWER mean on warm turns (wins 2/14); rule needed MTP >=8% BETTER on both reps"
+ },
+ "verdict": "stock mainline + no-draft is the practical serving config at 100k+ on this box; speculative decoding stays off in serving"
+}
